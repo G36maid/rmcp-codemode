@@ -420,3 +420,84 @@ async fn server_overflow_goes_to_the_configured_directory() {
     assert!(path.is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- host-native (non-MCP) tools ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_tools_join_the_sandbox_and_discovery() {
+    use rmcp_codemode_quickjs::server::NativeTool;
+    let server = CodemodeServer::new(vec![]).with_native_tools(vec![
+        NativeTool::new("bash", "Run a shell command", |args| async move {
+            Ok(json!({ "output": args["command"].as_str().unwrap_or("").to_uppercase() }))
+        })
+        .with_input_schema(json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })),
+        // No-argument native tool: `tools.ping()` with null args.
+        NativeTool::new(
+            "ping",
+            "Ping the host",
+            |_args| async move { Ok(json!("pong")) },
+        ),
+    ]);
+    let (client, _task) = host_client(server).await;
+    let value = result_value(
+        client
+            .call_tool(script_args(
+                r#"
+                const names = ALL_TOOLS.map((t) => t.name);
+                const shell = await tools.bash({ command: "hi" });
+                const ping = await tools.ping();
+                const decl = (await describeTool("bash")).declaration;
+                return { names, shell, ping, decl };
+                "#,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["names"], json!(["bash", "ping"]));
+    assert_eq!(value["shell"]["output"], "HI");
+    assert_eq!(value["ping"], "pong");
+    // The schema renders into the TypeScript declaration.
+    assert!(
+        value["decl"].as_str().unwrap().contains("command: string;"),
+        "{}",
+        value["decl"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_tools_default_to_codemode_only_but_can_be_direct() {
+    use rmcp_codemode_quickjs::server::NativeTool;
+    // Defaults: codemode-only, so tools/list shows just `codemode` — a
+    // host's built-ins are usually already native tools of their own.
+    let default_server = CodemodeServer::new(vec![]).with_native_tools(vec![NativeTool::new(
+        "bash",
+        "Run a shell command",
+        |_args| async move { Ok(json!({})) },
+    )]);
+    let (client, _task) = host_client(default_server).await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name.as_ref(), "codemode");
+
+    // Opting into Direct puts it on the host's list and in the inline
+    // declarations.
+    let server = CodemodeServer::new(vec![]).with_native_tools(vec![
+        NativeTool::new("bash", "Run a shell command", |_args| async move {
+            Ok(json!({}))
+        })
+        .with_exposure(ToolExposure::Direct),
+    ]);
+    let (client, _task) = host_client(server).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["codemode", "bash"]);
+    let description = tools[0].description.as_deref().unwrap();
+    assert!(
+        description.contains("declare function bash("),
+        "{description}"
+    );
+}

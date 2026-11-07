@@ -19,7 +19,7 @@ use rmcp_codemode::{
     aggregate::{Aggregator, UpstreamConfig, UpstreamHandle, UpstreamTransport},
     exposure::ToolExposure,
 };
-use rmcp_codemode_quickjs::server::CodemodeServer;
+use rmcp_codemode_quickjs::server::{CodemodeServer, NativeTool};
 use serde_json::json;
 
 /// A small upstream server with two tools whose outputs pipe together.
@@ -241,4 +241,89 @@ async fn unknown_script_tool_fails_with_registry_hint() {
         "got: {text}"
     );
     assert!(text.contains("weather.list_cities"), "got: {text}");
+}
+
+/// The host-native-tool pattern: a host like Zed has built-in tools (read,
+/// edit, bash, ...) that are not MCP. They enter the codemode sandbox the
+/// same way MCP tools do — as a path, a description, and a JSON dispatcher —
+/// so a script can pipe them with upstream MCP tools (pi: every session tool
+/// is a method of `tools`, native or not).
+#[tokio::test(flavor = "current_thread")]
+async fn native_host_tools_pipe_with_upstream_mcp_tools() {
+    // The host's own `bash`-like tool (not MCP, plain Rust) — defined with
+    // the parsed-JSON NativeTool API.
+    let native_bash = NativeTool::new("bash", "Run a shell command", |args| async move {
+        let command = args["command"].as_str().ok_or("missing command")?;
+        // A stand-in for the real executor; shape like pi's bash:
+        // { output, exit_code }.
+        Ok(json!({
+            "output": if command == "echo hello" { "hello" } else { "unknown" },
+            "exit_code": 0,
+        }))
+    })
+    .with_input_schema(json!({
+        "type": "object",
+        "properties": { "command": { "type": "string" } },
+        "required": ["command"]
+    }));
+
+    // Aggregate an MCP upstream as usual, then mix in the native tools.
+    let aggregator = Arc::new(
+        Aggregator::builder()
+            .upstream(upstream("weather", WeatherServer))
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let server = CodemodeServer::from_aggregator(aggregator)
+        .with_native_tools(vec![native_bash])
+        .with_timeout(Duration::from_secs(10));
+
+    let (client, _task) = host_client(server).await;
+    let script = r#"
+        // Native tool inside the script, piped with the MCP upstream tool:
+        const who = await tools.bash({ command: "echo hello" });
+        const cities = await tools.weather.list_cities({});
+        const readings = await Promise.all(
+            cities.map((city) => tools.weather.get_temperature({ city }))
+        );
+        return { shell: who.output, exitCode: who.exit_code, cities: cities.length, coldest: readings.reduce((a, b) => (b.celsius < a.celsius ? b : a)).city };
+    "#;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("codemode")
+                .with_arguments(json!({ "script": script }).as_object().cloned().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert!(!result.is_error.unwrap_or(false), "script failed");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap();
+    assert!(text.contains(r#""shell":"hello""#), "{text}");
+    assert!(text.contains("\"exitCode\":0"), "{text}");
+    assert!(text.contains("coldest"), "{text}");
+
+    // Native tools participate in discovery too.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("codemode").with_arguments(
+                json!({ "script": "return (await searchTools(\"shell\")).map((h) => h.name);" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap();
+    assert!(text.contains("bash"), "{text}");
 }

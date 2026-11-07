@@ -31,7 +31,7 @@ use rmcp::ServiceExt;
 use rmcp::transport::TokioChildProcess;
 use rmcp_codemode::aggregate::{Aggregator, UpstreamConfig};
 use rmcp_codemode::exposure::ToolExposure;
-use rmcp_codemode_quickjs::server::CodemodeServer;
+use rmcp_codemode_quickjs::server::{CodemodeServer, NativeTool};
 use rmcp::transport::stdio;
 
 #[tokio::main]
@@ -61,8 +61,23 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await?;
 
-    // 2. Serve the aggregated registry as one `codemode` tool.
-    let server = CodemodeServer::from_aggregator(Arc::new(aggregator));
+    // 2. Mix in host-native tools (non-MCP: read, edit, bash, ...) — they
+    //    become tools.<path> alongside every MCP tool, with the same
+    //    discovery and declarations. Default exposure is CodeModeOnly.
+    let native = vec![
+        NativeTool::new("bash", "Run a shell command", |args| async move {
+            run_shell(args["command"].as_str().unwrap_or(""))
+        })
+        .with_input_schema(json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })),
+    ];
+
+    // 3. Serve the aggregated registry as one `codemode` tool.
+    let server = CodemodeServer::from_aggregator(Arc::new(aggregator))
+        .with_native_tools(native);
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -162,6 +177,7 @@ Exposure states are observable at the server boundary (the mixing pi and OpenCod
 Known gaps:
 - One store per server (pi scopes stores per session/branch — a host with sessions would key persisters itself); `_meta` plumbing.
 - The aggregator reconnects upstreams only by rebuilding.
+- Native-tool executor errors do not carry typed codes (pi's bash result carries exit codes in-band; ours are plain error strings unless the tool encodes them in its return value).
 - Syntax-error messages carry no line numbers (QuickJS reports none; pi's Node runtime does).
 
 ## License

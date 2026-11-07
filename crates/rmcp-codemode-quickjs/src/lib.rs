@@ -1704,6 +1704,7 @@ pub mod server {
     }
 
     /// An upstream tool dispatcher wired into the sandbox.
+    #[derive(Clone)] // the executor is shared behind an Arc
     #[allow(clippy::exhaustive_structs)] // user-constructed by design
     pub struct UpstreamTool {
         /// Registry path, e.g. `github.list_issues`.
@@ -1766,6 +1767,98 @@ pub mod server {
             .collect()
     }
 
+    /// A host-native (non-MCP) tool for the codemode sandbox.
+    ///
+    /// A host like Zed has built-in tools — `read`, `edit`, `bash`, … — that
+    /// are not MCP servers. They enter the sandbox the same way MCP tools
+    /// do: as a path, a description, and a JSON dispatcher, so a script can
+    /// pipe them with upstream MCP tools (pi: every session tool is a method
+    /// of `tools`, native or not). The executor takes parsed JSON arguments
+    /// and returns a JSON value, so no string plumbing is needed.
+    #[allow(clippy::exhaustive_structs)] // user-constructed by design
+    pub struct NativeTool {
+        /// Registry path, e.g. `bash` or `fs.read`. Top-level paths put the
+        /// tool at `tools.bash`; dotted paths nest it like MCP namespaces.
+        pub path: String,
+        /// Description shown in `ALL_TOOLS` / `searchTools` and the inline
+        /// declarations.
+        pub description: String,
+        /// The tool's JSON Schema for its input (optional; without one the
+        /// TypeScript declaration types the argument as an open record).
+        pub input_schema: Option<Value>,
+        /// How the tool is exposed. Default [`ToolExposure::CodeModeOnly`]:
+        /// a host's built-ins are usually already native tools of their own
+        /// (`Direct` would duplicate them in `tools/list`); `CodeModeOnly`
+        /// makes them script-reachable without changing the host's list.
+        pub exposure: ToolExposure,
+        /// The parsed-JSON executor.
+        pub execute: NativeFn,
+    }
+
+    /// A native tool's executor: parsed JSON arguments in, a JSON value or
+    /// error message out.
+    pub type NativeFn = Arc<
+        dyn Fn(Value) -> std::pin::Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    impl NativeTool {
+        /// A codemode-only native tool from a path, a description, and an
+        /// async executor taking parsed JSON arguments.
+        pub fn new<F, Fut>(
+            path: impl Into<String>,
+            description: impl Into<String>,
+            execute: F,
+        ) -> Self
+        where
+            F: Fn(Value) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Result<Value, String>> + Send + 'static,
+        {
+            Self {
+                path: path.into(),
+                description: description.into(),
+                input_schema: None,
+                exposure: ToolExposure::CodeModeOnly,
+                execute: Arc::new(move |args: Value| Box::pin(execute(args))),
+            }
+        }
+
+        /// Attach the tool's JSON Schema for its input.
+        pub fn with_input_schema(mut self, schema: Value) -> Self {
+            self.input_schema = Some(schema);
+            self
+        }
+
+        /// Set the tool's exposure (default [`ToolExposure::CodeModeOnly`]).
+        pub fn with_exposure(mut self, exposure: ToolExposure) -> Self {
+            self.exposure = exposure;
+            self
+        }
+    }
+
+    impl From<NativeTool> for UpstreamTool {
+        fn from(native: NativeTool) -> Self {
+            let execute = native.execute;
+            UpstreamTool {
+                path: native.path,
+                description: Some(native.description),
+                input_schema: native.input_schema,
+                exposure: native.exposure,
+                execute: Arc::new(move |args_json: String| {
+                    let execute = Arc::clone(&execute);
+                    Box::pin(async move {
+                        // `"null"` arrives when the script called the tool
+                        // without arguments.
+                        let args: Value = serde_json::from_str(&args_json).unwrap_or(Value::Null);
+                        let value = execute(args).await?;
+                        serde_json::to_string(&value).map_err(|e| e.to_string())
+                    })
+                }),
+            }
+        }
+    }
+
     /// A ready-to-serve codemode MCP server over a set of upstream tools.
     ///
     /// Construct with [`CodemodeServer::new`], then serve it over any rmcp
@@ -1825,6 +1918,18 @@ pub mod server {
             let mut server = Self::new(tools_from_aggregator(aggregator));
             server.namespace_descriptions = Arc::new(namespace_descriptions);
             server
+        }
+
+        /// Mix host-native (non-MCP) tools into the sandbox: they become
+        /// `tools.<path>` alongside every MCP tool, with discovery and
+        /// declarations identical to upstream tools. Chain after
+        /// [`CodemodeServer::from_aggregator`] or [`CodemodeServer::new`].
+        pub fn with_native_tools(mut self, native: Vec<NativeTool>) -> Self {
+            let mut tools = (*self.tools).clone();
+            tools.extend(native.into_iter().map(UpstreamTool::from));
+            tools.sort_by(|a, b| a.path.cmp(&b.path));
+            self.tools = Arc::new(tools);
+            self
         }
 
         /// Set how directly-exposed tools are presented (default
