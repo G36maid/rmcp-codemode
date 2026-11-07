@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Serve as one codemode tool.
     let server = CodemodeServer::from_aggregator(Arc::clone(&aggregator))
         .with_timeout(Duration::from_secs(10));
-    let definition = CodemodeServer::tool_definition();
+    let definition = server.tool_definition();
     println!(
         "exposing 1 tool: {} ({})",
         definition.name,

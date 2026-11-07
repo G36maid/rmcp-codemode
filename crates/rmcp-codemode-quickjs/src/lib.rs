@@ -104,6 +104,13 @@ pub enum OutputItem {
     Text(String),
     /// A console line (`console.log` and friends).
     Console(String),
+    /// An image from `image()`: raw base64 payload and its MIME type.
+    Image {
+        /// The base64-encoded image bytes.
+        data: String,
+        /// The image's MIME type, e.g. `image/png`.
+        mime_type: String,
+    },
 }
 
 /// Output side-channel: the items plus a running character total, so the
@@ -167,6 +174,17 @@ pub const MAX_OUTPUT_CALLS: usize = 100_000;
 /// Characters per estimated model token, used to apply
 /// [`ScriptResult::max_output_tokens`] to rendered text.
 const CHARS_PER_TOKEN: usize = 4;
+
+/// The script-visible store: small JSON values kept across script runs.
+/// pi's semantics: writes buffer during the run and commit only when the
+/// script succeeds, so a failed script leaves no partial writes.
+pub type Store = Arc<Mutex<BTreeMap<String, Value>>>;
+
+/// Maximum characters of JSON for one stored value (pi's cap).
+pub const STORE_MAX_VALUE_CHARS: usize = 262_144;
+
+/// Maximum characters of JSON across all stored values (pi's cap).
+pub const STORE_MAX_TOTAL_CHARS: usize = 1_048_576;
 
 /// Parsed `@options` line from the first line of a script (pi's semantics:
 /// the options line is optional, must be the first line, and is validated
@@ -254,6 +272,9 @@ fn extract_options(source: &str) -> (String, Result<ScriptOptions, String>) {
 pub struct Sandbox {
     runtime: AsyncRuntime,
     context: AsyncContext,
+    /// Namespace descriptions served to `describeNamespace`; set by the host
+    /// (an aggregator knows its upstreams' descriptions).
+    namespace_descriptions: Arc<BTreeMap<String, String>>,
 }
 
 /// Default VM heap limit (pi's limit): 256 MB.
@@ -274,7 +295,17 @@ impl Sandbox {
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|e| SandboxError::Engine(e.to_string()))?;
-        Ok(Self { runtime, context })
+        Ok(Self {
+            runtime,
+            context,
+            namespace_descriptions: Arc::default(),
+        })
+    }
+
+    /// Set the namespace descriptions served to `describeNamespace` (pi's
+    /// namespace-level `description` field).
+    pub fn set_namespace_descriptions(&mut self, descriptions: BTreeMap<String, String>) {
+        self.namespace_descriptions = Arc::new(descriptions);
     }
 
     /// Execute a script.
@@ -289,6 +320,23 @@ impl Sandbox {
         source: &str,
         tools: Vec<SandboxTool>,
         deadline: Option<std::time::Duration>,
+    ) -> Result<ScriptResult, SandboxError> {
+        self.execute_with_store(source, tools, deadline, None).await
+    }
+
+    /// Execute a script with a persistent store.
+    ///
+    /// The store keeps small JSON values across script runs (pi's
+    /// `store`/`load`): the script's `store(key, value)` writes buffer during
+    /// the run and commit only when the script succeeds, so a failed script
+    /// leaves no partial writes. The same handle passed on the next run sees
+    /// the committed values.
+    pub async fn execute_with_store(
+        &self,
+        source: &str,
+        tools: Vec<SandboxTool>,
+        deadline: Option<std::time::Duration>,
+        store: Option<&Store>,
     ) -> Result<ScriptResult, SandboxError> {
         let started = Instant::now();
         let (source, options) = extract_options(source);
@@ -316,6 +364,9 @@ impl Sandbox {
         let calls: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let exit_requested = Arc::new(AtomicBool::new(false));
+        // Store writes buffer here during the run and commit on success.
+        let pending_store: Arc<Mutex<BTreeMap<String, Value>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
 
         // The interrupt handler gives the host two hard stops inside pure-JS
         // execution: the deadline, and a script's own exit() that a try/catch
@@ -347,6 +398,9 @@ impl Sandbox {
         let tool_map_arc = Arc::clone(&tool_map);
         let in_flight_arc = Arc::clone(&in_flight);
         let exit_flag = Arc::clone(&exit_requested);
+        let pending_store_arc = Arc::clone(&pending_store);
+        let store_arc = store.cloned();
+        let namespace_descriptions_arc = Arc::clone(&self.namespace_descriptions);
         // The deadline covers the whole execution — the script's own awaits
         // and upstream tool calls included (the interrupt handler handles
         // pure-JS loops; this backstop covers hung upstream calls).
@@ -363,6 +417,9 @@ impl Sandbox {
                         in_flight_arc,
                         exit_flag,
                         deadline_instant,
+                        pending_store_arc,
+                        store_arc,
+                        namespace_descriptions_arc,
                     )
                     .await
                 })
@@ -377,6 +434,22 @@ impl Sandbox {
             None => run.await?,
         };
         let mut result = finalize(envelope, &output, &calls);
+        // pi's semantics: store writes commit only when the script succeeds.
+        if let Some(store) = store
+            .filter(|_| result.ok)
+            .filter(|_| !pending_store.lock().unwrap().is_empty())
+        {
+            let mut pending = pending_store.lock().unwrap();
+            let mut committed = store.lock().unwrap();
+            for (key, value) in std::mem::take(&mut *pending) {
+                // Storing `undefined` deletes the key.
+                if value.is_null() {
+                    committed.remove(&key);
+                } else {
+                    committed.insert(key, value);
+                }
+            }
+        }
         // A swallowed exit() ends the script successfully with no value, even
         // if the script kept running pure-JS code and returned (pi: "ends the
         // script successfully on exit()").
@@ -394,6 +467,7 @@ impl Sandbox {
 }
 
 /// Bind globals, run the script, and return its result envelope.
+#[allow(clippy::too_many_arguments)] // bridge wiring, all needed
 async fn run_script<'js>(
     ctx: rquickjs::Ctx<'js>,
     source: &str,
@@ -403,6 +477,9 @@ async fn run_script<'js>(
     in_flight: Arc<AtomicUsize>,
     exit_requested: Arc<AtomicBool>,
     deadline_instant: Option<Instant>,
+    pending_store: Arc<Mutex<BTreeMap<String, Value>>>,
+    committed_store: Option<Store>,
+    namespace_descriptions: Arc<BTreeMap<String, String>>,
 ) -> Result<Value, SandboxError> {
     setup_globals(
         &ctx,
@@ -411,6 +488,9 @@ async fn run_script<'js>(
         Arc::clone(&tool_map),
         Arc::clone(&in_flight),
         Arc::clone(&exit_requested),
+        pending_store,
+        committed_store,
+        namespace_descriptions,
     )?;
     // The script is the body of an async function. The IIFE's result crosses
     // as a JSON envelope string so neither side needs native value conversion.
@@ -571,10 +651,11 @@ fn js_value_debug(value: &rquickjs::Value<'_>) -> String {
     }
 }
 
-/// Bind `__emitText`, `__emitConsole`, `__callTool`, `__searchTools`,
-/// `__describeTool`, and `__describeNamespace`, and the script-facing globals
-/// (`tools`, `text`, `console`, `ALL_TOOLS`, `searchTools`, `describeTool`,
-/// `describeNamespace`, `exit`).
+/// Bind `__emitText`, `__emitConsole`, `__emitImage`, `__storeValue`,
+/// `__loadValue`, `__callTool`, `__searchTools`, `__describeTool`, and
+/// `__describeNamespace`, and the script-facing globals (`tools`, `text`,
+/// `console`, `image`, `store`, `load`, `ALL_TOOLS`, `searchTools`,
+/// `describeTool`, `describeNamespace`, `exit`).
 #[allow(clippy::too_many_arguments)] // bridge wiring, all needed
 fn setup_globals<'js>(
     ctx: &rquickjs::Ctx<'js>,
@@ -583,6 +664,9 @@ fn setup_globals<'js>(
     tools: Arc<BTreeMap<String, SandboxTool>>,
     in_flight: Arc<AtomicUsize>,
     exit_requested: Arc<AtomicBool>,
+    pending_store: Arc<Mutex<BTreeMap<String, Value>>>,
+    committed_store: Option<Store>,
+    namespace_descriptions: Arc<BTreeMap<String, String>>,
 ) -> Result<(), SandboxError> {
     let globals = ctx.globals();
 
@@ -721,6 +805,117 @@ fn setup_globals<'js>(
             .map_err(rquickjs_error)?;
     }
 
+    // ---- image emitter: parses a data URI (`data:<mime>;base64,<data>`) or
+    // bare base64 (assumed PNG) into an image output item. ----
+    {
+        let output = Arc::clone(&output);
+        let exit_requested = Arc::clone(&exit_requested);
+        globals
+            .set(
+                "__emitImage",
+                Func::from(move |value: String| -> String {
+                    if exit_requested.load(Ordering::Relaxed) {
+                        return "script has exited".to_owned();
+                    }
+                    let Some((mime_type, data)) = parse_image_input(&value) else {
+                        return "image() expects a base64 data URI like data:image/png;base64,...".to_owned();
+                    };
+                    let mut guard = output.lock().unwrap();
+                    if guard.items.len() >= MAX_OUTPUT_CALLS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CALLS} output calls"
+                        );
+                    }
+                    if guard.chars + data.len() > MAX_OUTPUT_CHARS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CHARS} characters of output"
+                        );
+                    }
+                    guard.push(OutputItem::Image { data, mime_type });
+                    String::new()
+                }),
+            )
+            .map_err(rquickjs_error)?;
+    }
+
+    // ---- store bridges: writes buffer in `pending_store` (committed on
+    // script success); reads see pending writes first. ----
+    {
+        let pending_store = Arc::clone(&pending_store);
+        let committed_store = committed_store.clone();
+        let exit_requested = Arc::clone(&exit_requested);
+        globals
+            .set(
+                "__storeValue",
+                Func::from(
+                    move |key: String, value_json: String, is_delete: bool| -> String {
+                        if exit_requested.load(Ordering::Relaxed) {
+                            return "script has exited".to_owned();
+                        }
+                        let mut pending = pending_store.lock().unwrap();
+                        if is_delete {
+                            // Storing `undefined` deletes the key.
+                            pending.insert(key, Value::Null);
+                            return String::new();
+                        }
+                        if value_json.len() > STORE_MAX_VALUE_CHARS {
+                            return format!(
+                                "store limit exceeded: one value may hold at most {STORE_MAX_VALUE_CHARS} characters of JSON"
+                            );
+                        }
+                        let value: Value = match serde_json::from_str(&value_json) {
+                            Ok(value) => value,
+                            Err(e) => return format!("store() failed to encode the value: {e}"),
+                        };
+                        let committed_chars = committed_store
+                            .as_ref()
+                            .map(|store| {
+                                store
+                                    .lock()
+                                    .unwrap()
+                                    .values()
+                                    .map(|v| serde_json::to_string(v).map_or(0, |s| s.len()))
+                                    .sum::<usize>()
+                            })
+                            .unwrap_or(0);
+                        let pending_chars = pending
+                            .values()
+                            .map(|v| serde_json::to_string(v).map_or(0, |s| s.len()))
+                            .sum::<usize>();
+                        if committed_chars + pending_chars > STORE_MAX_TOTAL_CHARS {
+                            return format!(
+                                "store limit exceeded: all values together may hold at most {STORE_MAX_TOTAL_CHARS} characters of JSON"
+                            );
+                        }
+                        pending.insert(key, value);
+                        String::new()
+                    },
+                ),
+            )
+            .map_err(rquickjs_error)?;
+    }
+    {
+        let pending_store = Arc::clone(&pending_store);
+        let committed_store = committed_store.clone();
+        globals
+            .set(
+                "__loadValue",
+                Func::from(move |key: String| -> String {
+                    if let Some(value) = pending_store.lock().unwrap().get(&key).cloned() {
+                        return serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
+                    }
+                    if let Some(value) = committed_store
+                        .as_ref()
+                        .and_then(|store| store.lock().unwrap().get(&key).cloned())
+                    {
+                        return serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
+                    }
+                    "null".to_owned()
+                }),
+            )
+            .map_err(rquickjs_error)?;
+    }
+
     // ---- discovery bridges: pure synchronous reads over the tool map, so
     // they are plain closures returning JSON strings. ----
     {
@@ -745,11 +940,12 @@ fn setup_globals<'js>(
     }
     {
         let tools = Arc::clone(&tools);
+        let namespace_descriptions = Arc::clone(&namespace_descriptions);
         globals
             .set(
                 "__describeNamespace",
                 Func::from(move |name: String| -> String {
-                    describe_namespace_response(&tools, &name)
+                    describe_namespace_response(&tools, &namespace_descriptions, &name)
                 }),
             )
             .map_err(rquickjs_error)?;
@@ -864,6 +1060,25 @@ globalThis.console.info = globalThis.console.log;
 globalThis.console.warn = globalThis.console.log;
 globalThis.console.error = globalThis.console.log;
 globalThis.console.debug = globalThis.console.log;
+// image() adds an image output item from a base64 data URI.
+globalThis.image = (value) => {{
+    const err = globalThis.__emitImage(typeof value === "string" ? value : "");
+    if (err) throw new Error(err);
+}};
+// store(key, value) keeps a JSON value for later codemode calls; storing
+// undefined deletes the key. Writes commit only when the script succeeds.
+globalThis.store = (key, value) => {{
+    const err = globalThis.__storeValue(
+        String(key),
+        value === undefined ? "null" : JSON.stringify(value),
+        value === undefined,
+    );
+    if (err) throw new Error(err);
+}};
+globalThis.load = (key) => {{
+    const raw = globalThis.__loadValue(String(key));
+    return raw === "null" ? undefined : JSON.parse(raw);
+}};
 // exit() ends the script successfully: the sentinel unwinds the IIFE (the
 // rejection handler maps it to a successful envelope); if a try/catch
 // swallows it, the exit flag stops every host call afterward and the VM's
@@ -911,6 +1126,28 @@ impl Drop for InFlightGuard<'_> {
 fn len_of(item: &OutputItem) -> usize {
     match item {
         OutputItem::Text(text) | OutputItem::Console(text) => text.len(),
+        OutputItem::Image { data, .. } => data.len(),
+    }
+}
+
+/// Parse an `image()` argument: a `data:<mime>;base64,<data>` URI, or a bare
+/// base64 payload (assumed PNG).
+fn parse_image_input(value: &str) -> Option<(String, String)> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix("data:") {
+        let (metadata, data) = rest.split_once(",")?;
+        let mime_type = metadata
+            .strip_suffix(";base64")
+            .filter(|m| !m.is_empty())?
+            .to_owned();
+        if data.is_empty() {
+            return None;
+        }
+        Some((mime_type, data.to_owned()))
+    } else if !value.is_empty() {
+        Some(("image/png".to_owned(), value.to_owned()))
+    } else {
+        None
     }
 }
 
@@ -984,10 +1221,14 @@ fn describe_tool_response(tools: &BTreeMap<String, SandboxTool>, name: &str) -> 
     serde_json::to_string(&response).unwrap_or_else(|_| "null".to_owned())
 }
 
-/// The `describeNamespace(name)` response: `{ name, tools: [...] }` for a
-/// path prefix, or `null` when no tool lives under it. Namespace-level
-/// descriptions and instructions are not tracked yet, so they are omitted.
-fn describe_namespace_response(tools: &BTreeMap<String, SandboxTool>, name: &str) -> String {
+/// The `describeNamespace(name)` response: `{ name, description?, tools:
+/// [...] }` for a path prefix, or `null` when no tool lives under it. The
+/// namespace description comes from the host's registry when known.
+fn describe_namespace_response(
+    tools: &BTreeMap<String, SandboxTool>,
+    namespace_descriptions: &BTreeMap<String, String>,
+    name: &str,
+) -> String {
     let prefix = format!("{name}.");
     let members: Vec<&SandboxTool> = tools
         .iter()
@@ -1011,8 +1252,13 @@ fn describe_namespace_response(tools: &BTreeMap<String, SandboxTool>, name: &str
             })
         })
         .collect();
-    let response = json!({ "name": name, "tools": tools_json });
-    serde_json::to_string(&response).unwrap_or_else(|_| "null".to_owned())
+    let mut response = serde_json::Map::new();
+    response.insert("name".to_owned(), json!(name));
+    if let Some(description) = namespace_descriptions.get(name) {
+        response.insert("description".to_owned(), json!(description));
+    }
+    response.insert("tools".to_owned(), json!(tools_json));
+    serde_json::to_string(&Value::Object(response)).unwrap_or_else(|_| "null".to_owned())
 }
 
 /// Render a tool's TypeScript declaration (pi's `describeTool` shape): a doc
@@ -1123,33 +1369,57 @@ fn ts_type(schema: &Value) -> String {
 /// file; there is no file system here, so the full text is dropped).
 pub fn render_result_text(result: &ScriptResult) -> String {
     let mut sections: Vec<String> = Vec::new();
-    let mut all_text: Vec<String> = result
+    // Text and image items appear in output order (pi); the return value
+    // joins as a final text item (pi: `return value` adds the value like
+    // `text()`).
+    let mut items: Vec<OutputItem> = result
         .output
         .iter()
-        .filter_map(|item| match item {
-            OutputItem::Text(text) => Some(text.clone()),
-            OutputItem::Console(_) => None,
-        })
+        .filter(|item| !matches!(item, OutputItem::Console(_)))
+        .cloned()
         .collect();
-    // The return value joins the text items (pi: `return value` adds the
-    // value like `text()`).
     if let Some(value) = &result.value {
-        all_text.push(serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()));
+        items.push(OutputItem::Text(
+            serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+        ));
     }
-    let multiple = all_text.len() > 1;
-    let total = all_text.len();
-    for (index, text) in all_text.iter().enumerate() {
-        if multiple {
-            sections.push(format!("==> text {}/{} <==", index + 1, total));
+    let text_count = items
+        .iter()
+        .filter(|item| matches!(item, OutputItem::Text(_)))
+        .count();
+    let image_count = items
+        .iter()
+        .filter(|item| matches!(item, OutputItem::Image { .. }))
+        .count();
+    let (mut text_index, mut image_index) = (0usize, 0usize);
+    for item in &items {
+        match item {
+            OutputItem::Text(text) => {
+                text_index += 1;
+                if text_count > 1 {
+                    sections.push(format!("==> text {text_index}/{text_count} <=="));
+                }
+                sections.push(text.clone());
+            }
+            OutputItem::Image { data, mime_type } => {
+                image_index += 1;
+                if image_count > 1 {
+                    sections.push(format!("==> image {image_index}/{image_count} <=="));
+                }
+                sections.push(format!(
+                    "[image: {mime_type}, {} bytes of base64]",
+                    data.len()
+                ));
+            }
+            OutputItem::Console(_) => unreachable!("filtered out above"),
         }
-        sections.push(text.clone());
     }
     let console_lines: Vec<&String> = result
         .output
         .iter()
         .filter_map(|item| match item {
             OutputItem::Console(line) => Some(line),
-            OutputItem::Text(_) => None,
+            OutputItem::Text(_) | OutputItem::Image { .. } => None,
         })
         .collect();
     if !console_lines.is_empty() {
@@ -1289,7 +1559,7 @@ fn tokenize_path(path: &str) -> Vec<String> {
 /// model — they are callable as `tools.<namespace>.<tool>(args)` inside the
 /// script, discoverable via `ALL_TOOLS` (pi's semantics).
 pub mod server {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use rmcp::{
         ErrorData as McpError,
@@ -1300,15 +1570,37 @@ pub mod server {
         },
         service::{RequestContext, RoleServer},
     };
+    use rmcp_codemode::exposure::ToolExposure;
     use serde_json::{Value, json};
 
-    use super::{Sandbox, SandboxTool, ToolFn};
+    use super::{Sandbox, SandboxTool, Store, ToolFn};
 
     /// The single tool name exposed to hosts.
     pub const CODEMODE_TOOL_NAME: &str = "codemode";
 
     /// How many tool calls one script may make (safety bound).
     pub const DEFAULT_MAX_TOOL_CALLS: usize = 500;
+
+    /// The inline budget for tool declarations in the `codemode` description,
+    /// in estimated model tokens (pi's `codemode.inlineBudget`). Declarations
+    /// beyond the budget are omitted; the model finds those tools with
+    /// `searchTools` and `describeTool` inside the script.
+    pub const INLINE_BUDGET_TOKENS: u64 = 3_000;
+
+    /// How the server presents directly-exposed tools to the host.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[allow(clippy::exhaustive_enums)] // two fixed modes
+    pub enum CodemodeMode {
+        /// Direct tools stay in the host's `tools/list` and are additionally
+        /// declared in the `codemode` description (pi's `codemode.mode:
+        /// "on"`, the default).
+        #[default]
+        On,
+        /// Direct tools are hidden from the host's `tools/list` and listed in
+        /// the `codemode` description instead (pi's `codemode.mode: "only"`,
+        /// OpenCode 2.0's default for MCP servers).
+        Only,
+    }
 
     /// An upstream tool dispatcher wired into the sandbox.
     #[allow(clippy::exhaustive_structs)] // user-constructed by design
@@ -1320,6 +1612,11 @@ pub mod server {
         /// The tool's JSON Schema for its input, rendered into the TypeScript
         /// declarations `describeTool` / `describeNamespace` return.
         pub input_schema: Option<Value>,
+        /// How the tool is exposed. Direct tools appear in the host's
+        /// `tools/list` (mode [`CodemodeMode::On`]) and in the `codemode`
+        /// description's inline declarations; deferred and codemode-only
+        /// tools are discoverable only inside scripts.
+        pub exposure: ToolExposure,
         /// Async dispatcher: JSON args string → JSON result string.
         pub execute: ToolFn,
     }
@@ -1336,11 +1633,13 @@ pub mod server {
                 let path = entry.path.clone();
                 let description = entry.tool.description.as_ref().map(|d| d.to_string());
                 let input_schema = Some(Value::Object((*entry.tool.input_schema).clone()));
+                let exposure = entry.exposure;
                 let aggregator = std::sync::Arc::clone(&aggregator);
                 UpstreamTool {
                     path: path.clone(),
                     description,
                     input_schema,
+                    exposure,
                     execute: Arc::new(move |args_json: String| {
                         let aggregator = std::sync::Arc::clone(&aggregator);
                         let path = path.clone();
@@ -1376,6 +1675,9 @@ pub mod server {
         tools: Arc<Vec<UpstreamTool>>,
         timeout: Option<std::time::Duration>,
         memory_limit: usize,
+        mode: CodemodeMode,
+        namespace_descriptions: Arc<BTreeMap<String, String>>,
+        store: Store,
     }
 
     impl CodemodeServer {
@@ -1385,15 +1687,38 @@ pub mod server {
                 tools: Arc::new(tools),
                 timeout: None,
                 memory_limit: super::DEFAULT_MEMORY_LIMIT,
+                mode: CodemodeMode::default(),
+                namespace_descriptions: Arc::default(),
+                store: Arc::default(),
             }
         }
 
         /// Create the server from a connected aggregator: every registered
-        /// tool becomes callable from scripts, routed by registry path.
+        /// tool becomes callable from scripts, routed by registry path, with
+        /// the aggregator's namespace descriptions served to
+        /// `describeNamespace`.
         pub fn from_aggregator(
             aggregator: std::sync::Arc<rmcp_codemode::aggregate::Aggregator>,
         ) -> Self {
-            Self::new(tools_from_aggregator(aggregator))
+            let namespace_descriptions: BTreeMap<String, String> = aggregator
+                .namespaces()
+                .filter_map(|namespace| {
+                    aggregator
+                        .registry()
+                        .namespace_description(namespace)
+                        .map(|d| (namespace.to_owned(), d.to_owned()))
+                })
+                .collect();
+            let mut server = Self::new(tools_from_aggregator(aggregator));
+            server.namespace_descriptions = Arc::new(namespace_descriptions);
+            server
+        }
+
+        /// Set how directly-exposed tools are presented (default
+        /// [`CodemodeMode::On`]).
+        pub fn with_mode(mut self, mode: CodemodeMode) -> Self {
+            self.mode = mode;
+            self
         }
 
         /// Set a default script deadline.
@@ -1409,11 +1734,11 @@ pub mod server {
         }
 
         /// The tool description shown to the model: the script environment's
-        /// globals, minus upstream tools (deferred by default; the model
-        /// finds them with `searchTools` and `describeTool`).
-        pub fn tool_definition() -> Tool {
-            Tool::new(
-                CODEMODE_TOOL_NAME,
+        /// globals, plus TypeScript declarations for directly-exposed tools
+        /// within the inline budget (pi: deferred tools are not listed, the
+        /// model finds them with `searchTools`/`describeTool`).
+        pub fn tool_definition(&self) -> Tool {
+            let mut description = String::from(
                 "Run a JavaScript script that calls tools. Upstream tools are available \
                  as `tools.<namespace>.<tool>(args)` returning promises; use \
                  `Promise.allSettled` to fan out and filter results before returning. \
@@ -1421,14 +1746,24 @@ pub mod server {
                  reach the model — intermediate tool results stay inside the script.\n\n\
                  The script may start with an options line: \
                  `// @options: {\"max_output_tokens\": 2000, \"timeout_ms\": 60000}`.\n\n\
-                 Globals: `tools.*`, `text(value)`, `console.log(...)`, `exit()`, \
-                 `ALL_TOOLS` (every tool as `{ name, description }`), \
+                 Globals: `tools.*`, `text(value)`, `image(dataUri)`, \
+                 `console.log(...)`, `exit()`, `store(key, value)` / `load(key)`, \\
+                 `ALL_TOOLS` (every tool as `{ name, description }`), \\
                  `searchTools(query, { limit?, namespace? })` (BM25 ranking, \
                  default limit 8), `describeTool(name)` (description plus \
                  TypeScript declaration), `describeNamespace(name)`. The script \
                  is the body of an async function: top-level `await` and `return` \
                  work. No timers, network, or file system: a script waiting on a \
                  promise nothing can settle fails immediately.",
+            );
+            let inline = self.inline_declarations();
+            if !inline.is_empty() {
+                description.push_str("\n\n## Tools\n\n");
+                description.push_str(&inline);
+            }
+            Tool::new(
+                CODEMODE_TOOL_NAME,
+                description,
                 json!({
                     "type": "object",
                     "properties": {
@@ -1445,6 +1780,56 @@ pub mod server {
             )
         }
 
+        /// TypeScript declarations of directly-exposed tools, grouped by
+        /// namespace, within the inline budget (pi's `codemode.inlineBudget`:
+        /// declarations that do not fit are omitted — the model finds them
+        /// with `searchTools` and `describeTool` inside the script).
+        fn inline_declarations(&self) -> String {
+            let budget = (INLINE_BUDGET_TOKENS as usize) * super::CHARS_PER_TOKEN;
+            let mut used = 0usize;
+            let mut omitted = 0usize;
+            let mut by_namespace: BTreeMap<&str, Vec<&UpstreamTool>> = BTreeMap::new();
+            for tool in self.tools.iter().filter(|t| t.exposure.is_listed()) {
+                by_namespace
+                    .entry(tool.path.split('.').next().unwrap_or(&tool.path))
+                    .or_default()
+                    .push(tool);
+            }
+            let mut sections = String::new();
+            for (namespace, tools) in &by_namespace {
+                let mut members = String::new();
+                if let Some(description) = self.namespace_descriptions.get(*namespace) {
+                    members.push_str(&format!("<!-- {description} -->\n"));
+                }
+                for tool in tools {
+                    let declaration = super::ts_declaration(
+                        &tool.path,
+                        tool.description.as_deref(),
+                        tool.input_schema.as_ref(),
+                    );
+                    let needed = declaration.len() + 1;
+                    if used + needed > budget {
+                        omitted += 1;
+                        continue;
+                    }
+                    used += needed;
+                    members.push_str(&declaration);
+                    members.push('\n');
+                }
+                if members.is_empty() {
+                    continue;
+                }
+                sections.push_str(&format!("### {namespace}\n\n{members}\n"));
+            }
+            if omitted > 0 {
+                sections.push_str(&format!(
+                    "{omitted} more tools exceed the inline declaration budget; call them via \
+                     `tools.<path>(...)` and find them with `searchTools` or `describeTool`."
+                ));
+            }
+            sections
+        }
+
         /// Dispatch one script in a fresh VM, converting the sandbox result
         /// into an MCP `CallToolResult`.
         ///
@@ -1458,6 +1843,8 @@ pub mod server {
             let tools = Arc::clone(&self.tools);
             let timeout = self.timeout;
             let memory_limit = self.memory_limit;
+            let store = Arc::clone(&self.store);
+            let namespace_descriptions = Arc::clone(&self.namespace_descriptions);
             let outcome = tokio::spawn(async move {
                 let sandbox_tools: Vec<SandboxTool> = tools
                     .iter()
@@ -1473,8 +1860,11 @@ pub mod server {
                         }
                     })
                     .collect();
-                let sandbox = Sandbox::with_memory_limit(memory_limit).await?;
-                sandbox.execute(&script, sandbox_tools, timeout).await
+                let mut sandbox = Sandbox::with_memory_limit(memory_limit).await?;
+                sandbox.set_namespace_descriptions((*namespace_descriptions).clone());
+                sandbox
+                    .execute_with_store(&script, sandbox_tools, timeout, Some(&store))
+                    .await
             });
             let result = outcome
                 .await
@@ -1482,8 +1872,15 @@ pub mod server {
 
             // pi's codemode result format: a header with the wall time, the
             // script's text/console output, and `Script error:` on failure.
+            // Images additionally become MCP image content blocks, in output
+            // order after the text.
             let text = super::render_result_text(&result);
-            let content = vec![ContentBlock::text(text)];
+            let mut content = vec![ContentBlock::text(text)];
+            for item in &result.output {
+                if let super::OutputItem::Image { data, mime_type } = item {
+                    content.push(ContentBlock::image(data.clone(), mime_type.clone()));
+                }
+            }
             if result.ok {
                 Ok(CallToolResult::success(content))
             } else {
@@ -1504,8 +1901,24 @@ pub mod server {
             _request: Option<PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, McpError> {
+            let mut tools = vec![self.tool_definition()];
+            // Direct tools stay in the host's tools/list in `On` mode; `Only`
+            // hides them behind the codemode tool entirely (pi's
+            // `codemode.mode`, OpenCode 2.0's default).
+            if self.mode == CodemodeMode::On {
+                for tool in self.tools.iter().filter(|t| t.exposure.is_listed()) {
+                    tools.push(Tool::new(
+                        tool.path.clone(),
+                        tool.description.clone().unwrap_or_default(),
+                        tool.input_schema
+                            .clone()
+                            .and_then(|schema| schema.as_object().cloned())
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
             Ok(ListToolsResult {
-                tools: vec![Self::tool_definition()],
+                tools,
                 ..Default::default()
             })
         }
@@ -1516,7 +1929,7 @@ pub mod server {
             _context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, McpError> {
             if request.name != CODEMODE_TOOL_NAME {
-                return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                return self.call_upstream(&request.name, request.arguments).await;
             }
             let script = request
                 .arguments
@@ -1532,6 +1945,43 @@ pub mod server {
                 .await
                 .map(CallToolResponse::Complete)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))
+        }
+    }
+
+    impl CodemodeServer {
+        /// Route a native host call to a directly-exposed tool. Deferred and
+        /// codemode-only tools answer with an instructive error result (the
+        /// self-correction shape from Zed discussion #64004): the model is
+        /// told to call the tool from a script instead.
+        async fn call_upstream(
+            &self,
+            name: &str,
+            arguments: Option<rmcp::model::JsonObject>,
+        ) -> Result<CallToolResponse, McpError> {
+            let tool = self.tools.iter().find(|t| t.path == name);
+            let Some(tool) = tool else {
+                return Err(McpError::method_not_found::<CallToolRequestMethod>());
+            };
+            if !tool.exposure.is_listed() {
+                let exposure = tool.exposure;
+                let result = CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Tool '{name}' is {exposure} and not directly callable. Write a \
+                     codemode script instead: call `tools.{name}(...)` inside a `codemode` \
+                     tool call; discover it with `searchTools` inside the script."
+                ))]);
+                return Ok(CallToolResponse::Complete(result));
+            }
+            let args_json = arguments.map(Value::Object).unwrap_or(Value::Null);
+            let args_json = serde_json::to_string(&args_json)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match (tool.execute)(args_json).await {
+                Ok(value) => Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::text(value),
+                ]))),
+                Err(message) => Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                    ContentBlock::text(format!("{name}: {message}")),
+                ]))),
+            }
         }
     }
 }

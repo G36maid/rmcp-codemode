@@ -36,7 +36,7 @@ fn text_of(result: &rmcp_codemode_quickjs::ScriptResult) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             OutputItem::Text(t) => Some(t.clone()),
-            OutputItem::Console(_) => None,
+            OutputItem::Console(_) | OutputItem::Image { .. } => None,
         })
         .collect()
 }
@@ -47,7 +47,7 @@ fn console_of(result: &rmcp_codemode_quickjs::ScriptResult) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             OutputItem::Console(t) => Some(t.clone()),
-            OutputItem::Text(_) => None,
+            OutputItem::Text(_) | OutputItem::Image { .. } => None,
         })
         .collect()
 }
@@ -903,4 +903,146 @@ async fn render_result_text_matches_pi_format() {
     assert!(rendered.starts_with("Script failed in"));
     assert!(rendered.contains("partial"));
     assert!(rendered.ends_with("Script error: boom"), "{rendered}");
+}
+
+// ---- store/load (pi's session-backed store semantics) ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn store_commits_on_success_and_reads_across_runs() {
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use rmcp_codemode_quickjs::Store;
+
+    let store: Store = Arc::new(Mutex::new(BTreeMap::new()));
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute_with_store(
+            r#"
+            store("cursor", 42);
+            store("note", "keep me");
+            text(String(load("cursor") * 2));
+            return load("cursor");
+            "#,
+            vec![],
+            Some(Duration::from_secs(5)),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    // Within the run, the pending write is readable.
+    assert_eq!(result.output, vec![OutputItem::Text("84".to_owned())]);
+    // Committed for the next run.
+    assert_eq!(store.lock().unwrap().get("cursor"), Some(&json!(42)));
+
+    let result = sandbox
+        .execute_with_store(
+            "return load(\"note\");",
+            vec![],
+            Some(Duration::from_secs(5)),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.value, Some(json!("keep me")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_script_discards_store_writes() {
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use rmcp_codemode_quickjs::Store;
+
+    let store: Store = Arc::new(Mutex::new(BTreeMap::new()));
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute_with_store(
+            "store(\"k\", 1);\nthrow new Error(\"boom\");",
+            vec![],
+            Some(Duration::from_secs(5)),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+    assert!(!result.ok);
+    assert!(
+        store.lock().unwrap().is_empty(),
+        "failed writes must not commit"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn storing_undefined_deletes_the_key() {
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use rmcp_codemode_quickjs::Store;
+
+    let store: Store = Arc::new(Mutex::new(BTreeMap::new()));
+    store.lock().unwrap().insert("gone".to_owned(), json!(1));
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute_with_store(
+            "store(\"gone\", undefined); return load(\"gone\");",
+            vec![],
+            Some(Duration::from_secs(5)),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    assert_eq!(result.value, None);
+    assert!(!store.lock().unwrap().contains_key("gone"));
+}
+
+// ---- image output ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn image_parses_data_uris_and_rejects_garbage() {
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            image("data:image/png;base64,aGVsbG8=");
+            try { image("data:"); } catch (e) { return e.message; }
+            "#,
+            vec![],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(json!(
+            "image() expects a base64 data URI like data:image/png;base64,..."
+        ))
+    );
+    assert_eq!(
+        result.output,
+        vec![OutputItem::Image {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }]
+    );
+}
+
+// ---- namespace descriptions from the host ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn describe_namespace_includes_host_description() {
+    use std::collections::BTreeMap;
+    let mut sandbox = Sandbox::new().await.unwrap();
+    let mut descriptions = BTreeMap::new();
+    descriptions.insert("github".to_owned(), "The GitHub API".to_owned());
+    sandbox.set_namespace_descriptions(descriptions);
+    let result = sandbox
+        .execute(
+            "return await describeNamespace(\"github\");",
+            vec![sync_tool("github.list_issues", "List issues", json!(null))],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let namespace = result.value.unwrap();
+    assert_eq!(namespace["description"], "The GitHub API");
+    assert_eq!(namespace["name"], "github");
 }
