@@ -22,6 +22,7 @@ use rmcp::{
 
 use crate::{
     exposure::ToolExposure,
+    naming::NamingConvention,
     registry::{Registry, RegistryError},
 };
 
@@ -112,6 +113,11 @@ pub struct UpstreamConfig<T> {
     pub exposure: ToolExposure,
     /// A human-readable description, shown in discovery results.
     pub description: Option<String>,
+    /// How this server's tool paths are spelled. Different hosts and model
+    /// vendors expect different spellings (Claude Code flattens to
+    /// `mcp__<server>__<tool>`, OpenCode nests); the default
+    /// [`NamingConvention::Namespaced`] keeps the hierarchical model.
+    pub naming: NamingConvention,
     /// The transport factory.
     pub transport: T,
 }
@@ -159,7 +165,13 @@ pub struct Aggregator {
 /// Builder for [`Aggregator`].
 #[must_use]
 pub struct AggregatorBuilder {
-    configs: Vec<(String, ToolExposure, Option<String>, TransportFactory)>,
+    configs: Vec<(
+        String,
+        ToolExposure,
+        Option<String>,
+        NamingConvention,
+        TransportFactory,
+    )>,
 }
 
 impl Aggregator {
@@ -250,6 +262,7 @@ impl AggregatorBuilder {
             config.namespace,
             config.exposure,
             config.description,
+            config.naming,
             factory,
         ));
         self
@@ -270,38 +283,41 @@ impl AggregatorBuilder {
         let mut registry = Registry::new();
         let mut upstreams = BTreeMap::new();
 
-        let connections = self
-            .configs
-            .iter()
-            .map(|(namespace, _exposure, _desc, factory)| {
-                let namespace = namespace.clone();
-                async move {
-                    let handle = factory().await.map_err(|source| AggregateError::Upstream {
-                        namespace: namespace.clone(),
-                        source,
-                    })?;
-                    let tools: Vec<Tool> =
-                        handle.peer.list_all_tools().await.map_err(|source| {
-                            AggregateError::Upstream {
+        let connections =
+            self.configs
+                .iter()
+                .map(|(namespace, _exposure, _naming, _desc, factory)| {
+                    let namespace = namespace.clone();
+                    async move {
+                        let handle =
+                            factory().await.map_err(|source| AggregateError::Upstream {
                                 namespace: namespace.clone(),
-                                source: Box::new(source),
-                            }
-                        })?;
-                    Ok::<_, AggregateError>((namespace, handle, tools))
-                }
-            });
+                                source,
+                            })?;
+                        let tools: Vec<Tool> =
+                            handle.peer.list_all_tools().await.map_err(|source| {
+                                AggregateError::Upstream {
+                                    namespace: namespace.clone(),
+                                    source: Box::new(source),
+                                }
+                            })?;
+                        Ok::<_, AggregateError>((namespace, handle, tools))
+                    }
+                });
         let results = join_all(connections).await;
 
         for result in results {
             let (namespace, handle, tools) = result?;
-            if let Some((_, exposure, desc, _)) =
-                self.configs.iter().find(|(ns, _, _, _)| *ns == namespace)
+            if let Some((_, exposure, desc, naming, _)) = self
+                .configs
+                .iter()
+                .find(|(ns, _, _, _, _)| *ns == namespace)
             {
                 if let Some(desc) = desc {
                     registry.set_namespace_description(&namespace, desc.clone());
                 }
                 for tool in tools {
-                    registry.insert(&namespace, tool, *exposure)?;
+                    registry.insert_with_naming(&namespace, naming, tool, *exposure)?;
                 }
                 upstreams.insert(namespace, ConnectedUpstream { handle });
             }
@@ -374,6 +390,7 @@ mod tests {
             namespace: namespace.to_owned(),
             exposure: ToolExposure::Direct,
             description: Some(format!("{namespace} tools")),
+            naming: NamingConvention::default(),
             transport: move || {
                 let server = server.clone();
                 async move {
@@ -497,6 +514,7 @@ mod tests {
                 namespace: "ghidra".into(),
                 exposure: ToolExposure::CodeModeOnly,
                 description: None,
+                naming: NamingConvention::default(),
                 transport: upstream("ghidra", ghidra).transport,
             })
             .connect()
@@ -543,6 +561,7 @@ mod tests {
                 namespace: "broken".into(),
                 exposure: ToolExposure::Direct,
                 description: None,
+                naming: NamingConvention::default(),
                 transport: BrokenTransport,
             })
             .connect()

@@ -99,6 +99,7 @@ fn upstream(
         namespace: namespace.to_owned(),
         exposure: ToolExposure::CodeModeOnly,
         description: Some(format!("{namespace} tools")),
+        naming: Default::default(),
         transport: move || {
             let server = server.clone();
             async move {

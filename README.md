@@ -26,7 +26,7 @@ Code mode solves the first two problems in one mechanism: tool schemas stay out 
 
 | Crate | Purpose |
 |---------|-------------|
-| [`rmcp-codemode`](crates/rmcp-codemode) | Core, engine-agnostic: [`ToolExposure`](crates/rmcp-codemode/src/exposure.rs), the aggregated [`Registry`](crates/rmcp-codemode/src/registry.rs), the BM25 [`SearchIndex`](crates/rmcp-codemode/src/search.rs), the [`Aggregator`](crates/rmcp-codemode/src/aggregate.rs) (connect upstreams → registry → dispatch), plus the script contract — [`ScriptResult`](crates/rmcp-codemode/src/result.rs) and its model-facing rendering, TypeScript [`signature`](crates/rmcp-codemode/src/signature.rs) rendering, and tool-path [`identity`](crates/rmcp-codemode/src/identity.rs) rules |
+| [`rmcp-codemode`](crates/rmcp-codemode) | Core, engine-agnostic: [`ToolExposure`](crates/rmcp-codemode/src/exposure.rs), the aggregated [`Registry`](crates/rmcp-codemode/src/registry.rs), the BM25 [`SearchIndex`](crates/rmcp-codemode/src/search.rs), the [`Aggregator`](crates/rmcp-codemode/src/aggregate.rs) (connect upstreams → registry → dispatch), plus the script contract — [`ScriptResult`](crates/rmcp-codemode/src/result.rs) and its model-facing rendering, TypeScript [`signature`](crates/rmcp-codemode/src/signature.rs) rendering, and tool-path [`identity`](crates/rmcp-codemode/src/identity.rs) rules, and pluggable [`NamingConvention`](crates/rmcp-codemode/src/naming.rs)s for host-specific tool spellings |
 | [`rmcp-codemode-quickjs`](crates/rmcp-codemode-quickjs) | The QuickJS binding: the per-run VM ([`sandbox`](crates/rmcp-codemode-quickjs/src/sandbox.rs)), the globals [`bridge`](crates/rmcp-codemode-quickjs/src/bridge.rs), and the [`CodemodeServer`](crates/rmcp-codemode-quickjs/src/server.rs) — a drop-in `ServerHandler` exposing exactly one `codemode` tool |
 
 ## Transports
@@ -171,6 +171,19 @@ Per-tool overrides after connecting:
 ```rust,ignore
 aggregator.registry_mut().override_exposure("github.get_me", ToolExposure::Direct);
 ```
+
+## Naming conventions
+
+Different hosts and model vendors spell tool paths differently. The sandbox tree is *built from* registry paths, so any spelling works end to end — a flat path is a single-segment leaf, a dotted path nests. Pick per upstream via `UpstreamConfig::naming`:
+
+| Convention | Path for (`github`, `create_issue`) | Sandbox shape | Matches |
+|---|---|---|---|
+| `Namespaced` *(default)* | `github.create_issue` | nested; `Object.keys(tools.github)` enumerates | OpenCode |
+| `McpPrefixed` | `mcp__github__create_issue` | flat, one segment | Claude Code |
+| `Flat { separator }` | `github__create_issue` (with `__`) | flat | pi-style flattening |
+| `Custom(mapping)` | whatever the closure returns | follows the path's shape | anything else |
+
+The sandbox behaves identically in all cases — `ALL_TOOLS`, `searchTools`, close-match suggestions, and routing (the upstream always sees its own tool name) are spelling-agnostic. What differs: only `Namespaced` keeps namespace enumeration, namespace-scoped search, and per-namespace inline declarations, which is why it is the default.
 
 ## Development
 

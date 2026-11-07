@@ -8,7 +8,7 @@
 
 use rmcp::model::Tool;
 
-use crate::{exposure::ToolExposure, search::SearchIndex};
+use crate::{exposure::ToolExposure, naming::NamingConvention, search::SearchIndex};
 
 /// A single tool in the registry.
 #[derive(Clone, Debug)]
@@ -60,7 +60,21 @@ impl Registry {
         tool: Tool,
         exposure: ToolExposure,
     ) -> Result<&RegistryEntry, RegistryError> {
-        let path = format!("{namespace}.{}", tool.name);
+        self.insert_with_naming(namespace, &NamingConvention::Namespaced, tool, exposure)
+    }
+
+    /// Insert a tool under a path computed by `naming`. The entry still
+    /// records the declared `namespace` (for descriptions and grouping);
+    /// the path is whatever the convention spells — a flat path (no `.`)
+    /// presents as a single segment in the sandbox tree.
+    pub fn insert_with_naming(
+        &mut self,
+        namespace: &str,
+        naming: &NamingConvention,
+        tool: Tool,
+        exposure: ToolExposure,
+    ) -> Result<&RegistryEntry, RegistryError> {
+        let path = naming.path(namespace, tool.name.as_ref());
         if self.entries.contains_key(&path) {
             return Err(RegistryError::DuplicatePath(path));
         }

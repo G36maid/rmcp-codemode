@@ -501,3 +501,107 @@ async fn native_tools_default_to_codemode_only_but_can_be_direct() {
         "{description}"
     );
 }
+
+// ---- naming conventions: vendors spell tool paths differently ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn claude_style_flat_paths_work_end_to_end() {
+    use rmcp::service::ServiceExt;
+    use rmcp_codemode::{
+        aggregate::{Aggregator, UpstreamConfig, UpstreamHandle},
+        naming::NamingConvention,
+    };
+
+    // A Claude Code-style host: flat `mcp__<server>__<tool>` paths.
+    struct FlatServer;
+    impl rmcp::handler::server::ServerHandler for FlatServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(Default::default())
+        }
+        async fn list_tools(
+            &self,
+            _: Option<rmcp::model::PaginatedRequestParams>,
+            _: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            Ok(rmcp::model::ListToolsResult {
+                tools: vec![rmcp::model::Tool::new(
+                    "create_issue",
+                    "Create an issue",
+                    json!({ "type": "object", "properties": {} })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                )],
+                ..Default::default()
+            })
+        }
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            Ok(rmcp::model::CallToolResponse::Complete(
+                rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    serde_json::json!({ "created": request.name }).to_string(),
+                )]),
+            ))
+        }
+    }
+
+    let server = Arc::new(FlatServer);
+    let aggregator = Aggregator::builder()
+        .upstream(UpstreamConfig {
+            namespace: "github".into(),
+            exposure: ToolExposure::CodeModeOnly,
+            description: None,
+            naming: NamingConvention::McpPrefixed,
+            transport: move || {
+                let server = Arc::clone(&server);
+                async move {
+                    let (client_transport, server_transport) = tokio::io::duplex(8192);
+                    let task = tokio::spawn(async move { server.serve(server_transport).await });
+                    let client = ().serve(client_transport).await?;
+                    let peer = client.peer().clone();
+                    let keepalive = Box::pin(async move {
+                        let _ = client.waiting().await;
+                        let _ = task.await;
+                    });
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(UpstreamHandle::new(
+                        peer, keepalive,
+                    ))
+                }
+            },
+        })
+        .connect()
+        .await
+        .unwrap();
+
+    // The registry path is the flat Claude-style spelling.
+    let paths: Vec<&str> = aggregator
+        .registry()
+        .entries()
+        .map(|e| e.path.as_str())
+        .collect();
+    assert_eq!(paths, ["mcp__github__create_issue"]);
+
+    let codemode = CodemodeServer::from_aggregator(Arc::new(aggregator));
+    let (client, _task) = host_client(codemode).await;
+    let response = client
+        .call_tool(script_args(
+            r#"
+            return {
+                names: ALL_TOOLS.map((t) => t.name),
+                topSegments: Object.keys(tools),
+                called: await tools.mcp__github__create_issue({ title: "x" }),
+            };
+            "#,
+        ))
+        .await
+        .unwrap();
+    let value = result_value(response);
+    // Flat paths present flat: one top-level segment, the full spelling.
+    assert_eq!(value["names"], json!(["mcp__github__create_issue"]));
+    assert_eq!(value["topSegments"], json!(["mcp__github__create_issue"]));
+    // Routing strips the spelling: the upstream sees its own tool name.
+    assert_eq!(value["called"]["created"], "create_issue");
+}
