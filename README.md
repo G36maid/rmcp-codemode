@@ -146,10 +146,12 @@ Planned: a shared scenario set (N sequential tool calls, M parallel tool calls, 
 
 PoC, tracking [rust-sdk#1437](https://github.com/modelcontextprotocol/rust-sdk/issues/1437). Not on crates.io yet.
 
+The sandbox tracks pi's `codemode` semantics one-to-one where the host machinery allows: `searchTools(query, { limit?, namespace? })` (BM25 over names and descriptions, default limit 8, empty query lists in path order), `describeTool(name)` and `describeNamespace(name)` with TypeScript declarations rendered from the tools' JSON Schemas, `exit()`, the `// @options: {"max_output_tokens", "timeout_ms"}` first line, pi's output caps (16 MiB of text, 100k text/console calls) and result format (`Script completed`/`Script failed` with wall time, `==> text N/M <==` markers, `<console_output>` block, `Script error:`), and immediate failure for a script waiting on a promise nothing can settle. Pure-JS busy loops are preempted by the VM's interrupt handler at the deadline.
+
 Known gaps:
-- `searchTools()` inside scripts is not bound yet (the core `SearchIndex` exists; the sandbox binding is next).
-- No TypeScript declaration rendering yet (OpenCode's `signature.ts` is the reference for that).
-- No persistence (`store`/`load`), image output, or `_meta` exposure plumbing.
+- No persistence (`store`/`load`), image output, or `_meta` exposure plumbing (pi's store writes are session-backed; ours would need the same host machinery).
+- Namespace descriptions/instructions (`describeNamespace`'s optional fields) are not tracked yet.
+- No per-tool exposure filtering at the boundary yet: every registered tool enters the sandbox and none are listed in `tools/list` (the `ToolExposure` states exist in the core registry but the codemode server does not mix direct + codemode tools yet).
 - The aggregator reconnects upstreams only by rebuilding.
 
 ## License

@@ -26,10 +26,14 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
+use rmcp_codemode::search::SearchIndex;
 use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, Promise,
     prelude::{Async as AsyncFn, Func},
@@ -54,6 +58,9 @@ pub struct SandboxTool {
     pub name: String,
     /// Shown in `ALL_TOOLS` and `searchTools`.
     pub description: Option<String>,
+    /// The tool's JSON Schema for its input, when known. Rendered as a
+    /// TypeScript declaration by `describeTool` and `describeNamespace`.
+    pub input_schema: Option<Value>,
     /// The async dispatcher.
     pub execute: ToolFn,
 }
@@ -64,8 +71,16 @@ impl SandboxTool {
         Self {
             name: name.into(),
             description: Some(description.into()),
+            input_schema: None,
             execute,
         }
+    }
+
+    /// Attach the tool's JSON Schema for its input, enabling TypeScript
+    /// declarations in `describeTool`.
+    pub fn with_input_schema(mut self, schema: Value) -> Self {
+        self.input_schema = Some(schema);
+        self
     }
 }
 
@@ -89,6 +104,21 @@ pub enum OutputItem {
     Text(String),
     /// A console line (`console.log` and friends).
     Console(String),
+}
+
+/// Output side-channel: the items plus a running character total, so the
+/// output caps stay O(1) per call.
+#[derive(Default)]
+struct OutputBuffer {
+    items: Vec<OutputItem>,
+    chars: usize,
+}
+
+impl OutputBuffer {
+    fn push(&mut self, item: OutputItem) {
+        self.chars += len_of(&item);
+        self.items.push(item);
+    }
 }
 
 /// One tool call recorded during execution.
@@ -116,6 +146,108 @@ pub struct ScriptResult {
     pub output: Vec<OutputItem>,
     /// Tool calls made by the script, in order.
     pub calls: Vec<ToolCall>,
+    /// Wall time of the whole script, in milliseconds.
+    pub duration_ms: u128,
+    /// The output budget in model tokens from the script's `@options` line
+    /// (default [`DEFAULT_MAX_OUTPUT_TOKENS`]); applied by
+    /// [`render_result_text`].
+    pub max_output_tokens: u64,
+}
+
+/// Default output budget in model tokens (pi's default).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 10_000;
+
+/// Hard cap on total output characters across `text()` and `console` calls
+/// (pi's cap). A script that pushes past it fails.
+pub const MAX_OUTPUT_CHARS: usize = 16_777_216;
+
+/// Hard cap on `text()` and `console` calls (pi's cap).
+pub const MAX_OUTPUT_CALLS: usize = 100_000;
+
+/// Characters per estimated model token, used to apply
+/// [`ScriptResult::max_output_tokens`] to rendered text.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Parsed `@options` line from the first line of a script (pi's semantics:
+/// the options line is optional, must be the first line, and is validated
+/// before the script runs).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::exhaustive_structs)] // plain data record
+pub struct ScriptOptions {
+    /// Output budget in model tokens.
+    pub max_output_tokens: Option<u64>,
+    /// Whole-script deadline in milliseconds; overrides the host's default.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Split off and parse a leading `// @options: {...}` line. Returns the
+/// (unchanged) source and the parse outcome; an options line anywhere but
+/// the first line is an error, as is malformed JSON or a bad value.
+fn extract_options(source: &str) -> (String, Result<ScriptOptions, String>) {
+    let mut options = ScriptOptions::default();
+    let mut lines = source.lines();
+    if let Some(rest) = lines
+        .next()
+        .and_then(|first| first.trim().strip_prefix("// @options:"))
+    {
+        let parsed: Value = match serde_json::from_str(rest.trim()) {
+            Ok(value) => value,
+            Err(e) => {
+                return (
+                    source.to_owned(),
+                    Err(format!("invalid @options line: {e}")),
+                );
+            }
+        };
+        let Some(object) = parsed.as_object() else {
+            return (
+                source.to_owned(),
+                Err("invalid @options line: expected a JSON object".to_owned()),
+            );
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "max_output_tokens" => match value.as_u64() {
+                    Some(n) => options.max_output_tokens = Some(n),
+                    None => {
+                        return (
+                                source.to_owned(),
+                                Err("invalid @options line: max_output_tokens must be a non-negative integer".to_owned()),
+                            );
+                    }
+                },
+                "timeout_ms" => match value.as_u64() {
+                    Some(n) => options.timeout_ms = Some(n),
+                    None => {
+                        return (
+                            source.to_owned(),
+                            Err(
+                                "invalid @options line: timeout_ms must be a non-negative integer"
+                                    .to_owned(),
+                            ),
+                        );
+                    }
+                },
+                other => {
+                    return (
+                        source.to_owned(),
+                        Err(format!("invalid @options line: unknown option '{other}'")),
+                    );
+                }
+            }
+        }
+    }
+    if source
+        .lines()
+        .skip(1)
+        .any(|line| line.contains("// @options:"))
+    {
+        return (
+            source.to_owned(),
+            Err("the @options line must be the first line".to_owned()),
+        );
+    }
+    (source.to_owned(), Ok(options))
 }
 
 /// The sandbox: one QuickJS runtime, reused across script executions.
@@ -148,19 +280,55 @@ impl Sandbox {
     /// Execute a script.
     ///
     /// `deadline` is a hard wall-clock limit for the whole script, including
-    /// upstream tool calls; scripts that exceed it fail without their partial
-    /// output being distinguishable from other failures. `None` means no
-    /// deadline. Note that a script spinning in a pure-JS infinite loop
-    /// without awaiting cannot be preempted by this sandbox build; a deadline
-    /// still bounds how long `execute` waits before reporting failure.
+    /// upstream tool calls; a script may extend or replace it with its own
+    /// `// @options: {"timeout_ms": ...}` first line (pi's semantics). The
+    /// deadline preempts pure-JS busy loops via the VM's interrupt handler.
+    /// `None` means no deadline.
     pub async fn execute(
         &self,
         source: &str,
         tools: Vec<SandboxTool>,
         deadline: Option<std::time::Duration>,
     ) -> Result<ScriptResult, SandboxError> {
-        let output: Arc<Mutex<Vec<OutputItem>>> = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let (source, options) = extract_options(source);
+        let options = match options {
+            Ok(options) => options,
+            Err(message) => {
+                return Ok(ScriptResult {
+                    ok: false,
+                    error: Some(message),
+                    duration_ms: started.elapsed().as_millis(),
+                    max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                    ..ScriptResult::default()
+                });
+            }
+        };
+        // The script's own options line wins over the host default (pi's
+        // semantics: the options line is the script's voice).
+        let deadline = options
+            .timeout_ms
+            .map(std::time::Duration::from_millis)
+            .or(deadline);
+        let deadline_instant = deadline.map(|d| started + d);
+
+        let output: Arc<Mutex<OutputBuffer>> = Arc::new(Mutex::new(OutputBuffer::default()));
         let calls: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+
+        // The interrupt handler gives the host two hard stops inside pure-JS
+        // execution: the deadline, and a script's own exit() that a try/catch
+        // swallowed.
+        {
+            let exit_requested = Arc::clone(&exit_requested);
+            self.runtime
+                .set_interrupt_handler(Some(Box::new(move || {
+                    exit_requested.load(Ordering::Relaxed)
+                        || deadline_instant.is_some_and(|d| Instant::now() >= d)
+                })))
+                .await;
+        }
 
         let mut tool_map: BTreeMap<String, SandboxTool> = BTreeMap::new();
         for tool in tools {
@@ -174,17 +342,29 @@ impl Sandbox {
         }
         let tool_map = Arc::new(tool_map);
 
-        let source = source.to_owned();
         let output_arc = Arc::clone(&output);
         let calls_arc = Arc::clone(&calls);
         let tool_map_arc = Arc::clone(&tool_map);
+        let in_flight_arc = Arc::clone(&in_flight);
+        let exit_flag = Arc::clone(&exit_requested);
         // The deadline covers the whole execution — the script's own awaits
-        // and upstream tool calls included.
+        // and upstream tool calls included (the interrupt handler handles
+        // pure-JS loops; this backstop covers hung upstream calls).
         let run = async {
             let envelope: Value = self
                 .context
                 .async_with(async |ctx| {
-                    run_script(ctx, &source, output_arc, calls_arc, tool_map_arc).await
+                    run_script(
+                        ctx,
+                        &source,
+                        output_arc,
+                        calls_arc,
+                        tool_map_arc,
+                        in_flight_arc,
+                        exit_flag,
+                        deadline_instant,
+                    )
+                    .await
                 })
                 .await?;
             self.runtime.idle().await;
@@ -196,7 +376,20 @@ impl Sandbox {
                 .map_err(|_| SandboxError::Script("script exceeded its deadline".into()))??,
             None => run.await?,
         };
-        Ok(finalize(envelope, &output, &calls))
+        let mut result = finalize(envelope, &output, &calls);
+        // A swallowed exit() ends the script successfully with no value, even
+        // if the script kept running pure-JS code and returned (pi: "ends the
+        // script successfully on exit()").
+        if exit_requested.load(Ordering::Relaxed) {
+            result.ok = true;
+            result.error = None;
+            result.value = None;
+        }
+        result.duration_ms = started.elapsed().as_millis();
+        result.max_output_tokens = options
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        Ok(result)
     }
 }
 
@@ -204,30 +397,103 @@ impl Sandbox {
 async fn run_script<'js>(
     ctx: rquickjs::Ctx<'js>,
     source: &str,
-    output: Arc<Mutex<Vec<OutputItem>>>,
+    output: Arc<Mutex<OutputBuffer>>,
     calls: Arc<Mutex<Vec<ToolCall>>>,
     tool_map: Arc<BTreeMap<String, SandboxTool>>,
+    in_flight: Arc<AtomicUsize>,
+    exit_requested: Arc<AtomicBool>,
+    deadline_instant: Option<Instant>,
 ) -> Result<Value, SandboxError> {
-    setup_globals(&ctx, output, calls, tool_map)?;
+    setup_globals(
+        &ctx,
+        Arc::clone(&output),
+        Arc::clone(&calls),
+        Arc::clone(&tool_map),
+        Arc::clone(&in_flight),
+        Arc::clone(&exit_requested),
+    )?;
     // The script is the body of an async function. The IIFE's result crosses
     // as a JSON envelope string so neither side needs native value conversion.
+    // A thrown `{ __codemode_exit: true }` sentinel (from `exit()`) resolves
+    // the script successfully with no value.
     let wrapped = format!(
-        "(async () => {{\n{source}\n}})().then(\n\x20 (v) => JSON.stringify({{ ok: true, value: v === undefined ? null : v }}),\n\x20 (e) => JSON.stringify({{ ok: false, error: e && e.message !== undefined ? String(e.message) : String(e) }})\n )"
+        "(async () => {{\n{source}\n}})().then(\n\x20 (v) => JSON.stringify({{ ok: true, value: v === undefined ? null : v }}),\n\x20 (e) => e && e.__codemode_exit\n\x20   ? JSON.stringify({{ ok: true, value: null }})\n\x20   : JSON.stringify({{ ok: false, error: e && e.message !== undefined ? String(e.message) : String(e) }})\n )"
     );
     // A parse error or an unsettled promise surfaces as a failed result, not
     // an Err: pi reports script failures through the result, and partial
     // output (text before the failure) is kept.
     let promise: Promise = match ctx.eval(wrapped.as_bytes()).catch(&ctx) {
         Ok(promise) => promise,
-        Err(caught) => return Ok(failed_envelope(describe_caught(&ctx, caught))),
+        Err(caught) => {
+            return Ok(classified_envelope(
+                &ctx,
+                describe_caught(&ctx, caught),
+                &exit_requested,
+                deadline_instant,
+            ));
+        }
     };
-    let envelope: String = match promise.into_future::<String>().await.catch(&ctx) {
-        Ok(envelope) => envelope,
-        Err(caught) => return Ok(failed_envelope(describe_caught(&ctx, caught))),
+    // Poll the result promise in short ticks so a script that waits on a
+    // promise nothing can settle (pi's semantics: no timers here, so that is
+    // any promise with no tool call pending) fails immediately instead of
+    // hanging until a deadline that may not exist.
+    let mut future = Box::pin(promise.into_future::<String>());
+    let tick = std::time::Duration::from_millis(25);
+    let mut idle_ticks = 0u32;
+    let envelope: String = loop {
+        match tokio::time::timeout(tick, future.as_mut()).await {
+            Ok(Ok(envelope)) => break envelope,
+            Ok(Err(err)) => {
+                return Ok(classified_envelope(
+                    &ctx,
+                    describe_error(&ctx, &err),
+                    &exit_requested,
+                    deadline_instant,
+                ));
+            }
+            Err(_) => {
+                if exit_requested.load(Ordering::Relaxed) {
+                    return Ok(failed_envelope(
+                        "script called exit() but never finished".into(),
+                    ));
+                }
+                if in_flight.load(Ordering::Relaxed) == 0 {
+                    idle_ticks += 1;
+                    if idle_ticks >= 3 {
+                        return Ok(failed_envelope(
+                            "script waits on a promise that can never settle (no timers; no tool call pending)"
+                                .into(),
+                        ));
+                    }
+                } else {
+                    idle_ticks = 0;
+                }
+            }
+        }
     };
 
     serde_json::from_str(&envelope)
         .map_err(|e| SandboxError::Engine(format!("bad result envelope: {e}")))
+}
+
+/// Classify an error caught at the Rust boundary: an exit request resolves
+/// the script successfully (pi: `exit()` ends the script successfully), a
+/// deadline interruption reports the deadline, everything else is the
+/// script's error.
+fn classified_envelope(
+    ctx: &rquickjs::Ctx<'_>,
+    message: String,
+    exit_requested: &AtomicBool,
+    deadline_instant: Option<Instant>,
+) -> Value {
+    let _ = ctx;
+    if exit_requested.load(Ordering::Relaxed) {
+        return json!({ "ok": true, "value": null });
+    }
+    if deadline_instant.is_some_and(|d| Instant::now() >= d) {
+        return failed_envelope("script exceeded its deadline".into());
+    }
+    failed_envelope(message)
 }
 
 /// An envelope for a script that failed before producing one.
@@ -238,7 +504,7 @@ fn failed_envelope(message: String) -> Value {
 /// Build the final [`ScriptResult`] from the result envelope and side channels.
 fn finalize(
     envelope: Value,
-    output: &Mutex<Vec<OutputItem>>,
+    output: &Mutex<OutputBuffer>,
     calls: &Mutex<Vec<ToolCall>>,
 ) -> ScriptResult {
     let ok = envelope.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -252,8 +518,9 @@ fn finalize(
         ok,
         error,
         value,
-        output: std::mem::take(&mut *output.lock().unwrap()),
+        output: std::mem::take(&mut output.lock().unwrap().items),
         calls: std::mem::take(&mut *calls.lock().unwrap()),
+        ..ScriptResult::default()
     }
 }
 
@@ -304,36 +571,73 @@ fn js_value_debug(value: &rquickjs::Value<'_>) -> String {
     }
 }
 
-/// Bind `__emitText`, `__emitConsole`, `__callTool`, `__searchTools`, and the
-/// script-facing globals (`tools`, `text`, `console`, `ALL_TOOLS`,
-/// `searchTools`).
+/// Bind `__emitText`, `__emitConsole`, `__callTool`, `__searchTools`,
+/// `__describeTool`, and `__describeNamespace`, and the script-facing globals
+/// (`tools`, `text`, `console`, `ALL_TOOLS`, `searchTools`, `describeTool`,
+/// `describeNamespace`, `exit`).
+#[allow(clippy::too_many_arguments)] // bridge wiring, all needed
 fn setup_globals<'js>(
     ctx: &rquickjs::Ctx<'js>,
-    output: Arc<Mutex<Vec<OutputItem>>>,
+    output: Arc<Mutex<OutputBuffer>>,
     calls: Arc<Mutex<Vec<ToolCall>>>,
     tools: Arc<BTreeMap<String, SandboxTool>>,
+    in_flight: Arc<AtomicUsize>,
+    exit_requested: Arc<AtomicBool>,
 ) -> Result<(), SandboxError> {
     let globals = ctx.globals();
 
-    // ---- output emitters (strings already; JS stringifies non-strings) ----
+    // ---- output emitters: return an error message (empty = ok) when an
+    // output cap is hit or the script has exited; the JS leaf throws it. ----
     {
         let output = Arc::clone(&output);
+        let exit_requested = Arc::clone(&exit_requested);
         globals
             .set(
                 "__emitText",
-                Func::from(move |text: String| {
-                    output.lock().unwrap().push(OutputItem::Text(text));
+                Func::from(move |text: String| -> String {
+                    if exit_requested.load(Ordering::Relaxed) {
+                        return "script has exited".to_owned();
+                    }
+                    let mut guard = output.lock().unwrap();
+                    if guard.items.len() >= MAX_OUTPUT_CALLS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CALLS} text/console calls"
+                        );
+                    }
+                    if guard.chars + text.len() > MAX_OUTPUT_CHARS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CHARS} characters of output"
+                        );
+                    }
+                    guard.push(OutputItem::Text(text));
+                    String::new()
                 }),
             )
             .map_err(rquickjs_error)?;
     }
     {
         let output = Arc::clone(&output);
+        let exit_requested = Arc::clone(&exit_requested);
         globals
             .set(
                 "__emitConsole",
-                Func::from(move |line: String| {
-                    output.lock().unwrap().push(OutputItem::Console(line));
+                Func::from(move |line: String| -> String {
+                    if exit_requested.load(Ordering::Relaxed) {
+                        return "script has exited".to_owned();
+                    }
+                    let mut guard = output.lock().unwrap();
+                    if guard.items.len() >= MAX_OUTPUT_CALLS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CALLS} text/console calls"
+                        );
+                    }
+                    if guard.chars + line.len() > MAX_OUTPUT_CHARS {
+                        return format!(
+                            "output limit exceeded: more than {MAX_OUTPUT_CHARS} characters of output"
+                        );
+                    }
+                    guard.push(OutputItem::Console(line));
+                    String::new()
                 }),
             )
             .map_err(rquickjs_error)?;
@@ -347,59 +651,117 @@ fn setup_globals<'js>(
     {
         let calls = Arc::clone(&calls);
         let tools = Arc::clone(&tools);
+        let in_flight = Arc::clone(&in_flight);
+        let exit_requested = Arc::clone(&exit_requested);
         let call_tool = move |path: String, args_json: String| {
             let calls = Arc::clone(&calls);
             let tools = Arc::clone(&tools);
+            let in_flight = Arc::clone(&in_flight);
+            let exit_requested = Arc::clone(&exit_requested);
             async move {
-                let dispatch =
-                    async |calls: Arc<Mutex<Vec<ToolCall>>>,
-                           tools: Arc<BTreeMap<String, SandboxTool>>| {
-                        // Identifier aliases, first registration wins on collision
-                        // (pi's semantics: `tools.my_tool` reaches `my-tool`).
-                        let canonical = if tools.contains_key(&path) {
-                            Some(path.clone())
-                        } else {
-                            tools
-                                .keys()
-                                .find(|known| normalize_identifier(known) == path)
-                                .cloned()
-                        };
-                        let Some(tool_path) = canonical else {
-                            return Ok::<String, rquickjs::Error>(
-                                json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
-                                    .to_string(),
-                            );
-                        };
-                        let path = tool_path;
-                        let Some(tool) = tools.get(&path) else {
-                            return Ok(json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
-                                .to_string());
-                        };
-                        // Validate the argument shape only when the script sent one;
-                        // `JSON.stringify(undefined)` arrives as the string "undefined".
-                        if args_json != "null" && serde_json::from_str::<Value>(&args_json).is_err()
-                        {
-                            return Ok(json!({ "ok": false, "error": format!("Invalid arguments for tool '{path}': not valid JSON") }).to_string());
-                        }
-                        let started = Instant::now();
-                        let result = (tool.execute)(args_json.clone()).await;
-                        calls.lock().unwrap().push(ToolCall {
-                            name: path.clone(),
-                            duration_ms: started.elapsed().as_millis(),
-                        });
-                        Ok(match result {
+                let dispatch = async |calls: Arc<Mutex<Vec<ToolCall>>>,
+                                      tools: Arc<BTreeMap<String, SandboxTool>>,
+                                      in_flight: Arc<AtomicUsize>| {
+                    if exit_requested.load(Ordering::Relaxed) {
+                        return Ok::<String, rquickjs::Error>(
+                            json!({ "ok": false, "error": "script has exited" }).to_string(),
+                        );
+                    }
+                    // Identifier aliases, first registration wins on collision
+                    // (pi's semantics: `tools.my_tool` reaches `my-tool`).
+                    let canonical = if tools.contains_key(&path) {
+                        Some(path.clone())
+                    } else {
+                        tools
+                            .keys()
+                            .find(|known| normalize_identifier(known) == path)
+                            .cloned()
+                    };
+                    let Some(tool_path) = canonical else {
+                        return Ok::<String, rquickjs::Error>(
+                            json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
+                                .to_string(),
+                        );
+                    };
+                    let path = tool_path;
+                    let Some(tool) = tools.get(&path) else {
+                        return Ok(
+                            json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
+                                .to_string(),
+                        );
+                    };
+                    // Validate the argument shape only when the script sent one;
+                    // `JSON.stringify(undefined)` arrives as the string "undefined".
+                    if args_json != "null" && serde_json::from_str::<Value>(&args_json).is_err() {
+                        return Ok(json!({ "ok": false, "error": format!("Invalid arguments for tool '{path}': not valid JSON") }).to_string());
+                    }
+                    // The in-flight counter powers never-settling detection:
+                    // while any upstream call is pending, waiting is legal.
+                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    let _guard = InFlightGuard(&in_flight);
+                    let started = Instant::now();
+                    let result = (tool.execute)(args_json.clone()).await;
+                    calls.lock().unwrap().push(ToolCall {
+                        name: path.clone(),
+                        duration_ms: started.elapsed().as_millis(),
+                    });
+                    Ok(match result {
                         Ok(value) => match serde_json::from_str::<Value>(&value) {
                             Ok(parsed) => json!({ "ok": true, "value": parsed }).to_string(),
                             Err(e) => json!({ "ok": false, "error": format!("Tool '{path}' returned invalid JSON: {e}") }).to_string(),
                         },
                         Err(message) => json!({ "ok": false, "error": format!("{path}: {message}") }).to_string(),
                     })
-                    };
-                dispatch(calls, tools).await
+                };
+                dispatch(calls, tools, in_flight).await
             }
         };
         globals
             .set("__callTool", Func::from(AsyncFn(call_tool)))
+            .map_err(rquickjs_error)?;
+    }
+
+    // ---- discovery bridges: pure synchronous reads over the tool map, so
+    // they are plain closures returning JSON strings. ----
+    {
+        let tools = Arc::clone(&tools);
+        globals
+            .set(
+                "__searchTools",
+                Func::from(move |query: String, opts_json: String| -> String {
+                    search_tools_response(&tools, &query, &opts_json)
+                }),
+            )
+            .map_err(rquickjs_error)?;
+    }
+    {
+        let tools = Arc::clone(&tools);
+        globals
+            .set(
+                "__describeTool",
+                Func::from(move |name: String| -> String { describe_tool_response(&tools, &name) }),
+            )
+            .map_err(rquickjs_error)?;
+    }
+    {
+        let tools = Arc::clone(&tools);
+        globals
+            .set(
+                "__describeNamespace",
+                Func::from(move |name: String| -> String {
+                    describe_namespace_response(&tools, &name)
+                }),
+            )
+            .map_err(rquickjs_error)?;
+    }
+
+    {
+        let exit_requested = Arc::clone(&exit_requested);
+        globals
+            .set(
+                "__requestExit",
+                Func::from(move || exit_requested.store(true, Ordering::Relaxed)),
+            )
             .map_err(rquickjs_error)?;
     }
 
@@ -489,15 +851,37 @@ globalThis.__makeNamespace = function (prefix) {{
 }};
 
 globalThis.text = (value) => {{
-    globalThis.__emitText(typeof value === "string" ? value : JSON.stringify(value));
+    const err = globalThis.__emitText(typeof value === "string" ? value : JSON.stringify(value));
+    if (err) throw new Error(err);
 }};
 globalThis.console = {{
-    log: (...parts) => globalThis.__emitConsole(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")),
+    log: (...parts) => {{
+        const err = globalThis.__emitConsole(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
+        if (err) throw new Error(err);
+    }},
 }};
 globalThis.console.info = globalThis.console.log;
 globalThis.console.warn = globalThis.console.log;
 globalThis.console.error = globalThis.console.log;
 globalThis.console.debug = globalThis.console.log;
+// exit() ends the script successfully: the sentinel unwinds the IIFE (the
+// rejection handler maps it to a successful envelope); if a try/catch
+// swallows it, the exit flag stops every host call afterward and the VM's
+// interrupt handler aborts at the next loop or function entry.
+globalThis.exit = () => {{
+    globalThis.__requestExit();
+    throw {{ __codemode_exit: true }};
+}};
+globalThis.searchTools = async (query, options) =>
+    JSON.parse(globalThis.__searchTools(query === undefined ? "" : String(query), JSON.stringify(options ?? {{}})));
+globalThis.describeTool = async (name) => {{
+    const raw = globalThis.__describeTool(String(name));
+    return raw === "null" ? undefined : JSON.parse(raw);
+}};
+globalThis.describeNamespace = async (name) => {{
+    const raw = globalThis.__describeNamespace(String(name));
+    return raw === "null" ? undefined : JSON.parse(raw);
+}};
 "#,
         tools_spec_literal = serde_json::to_string(
             &serde_json::to_string(&tools.keys().cloned().collect::<Vec<_>>())
@@ -511,6 +895,297 @@ globalThis.console.debug = globalThis.console.log;
         .catch(ctx)
         .map_err(|caught| SandboxError::Script(describe_caught(ctx, caught)))?;
     Ok(())
+}
+
+/// Decrement the in-flight tool-call counter when the dispatch future ends,
+/// however it ends.
+struct InFlightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Total characters of an output list, for the output caps.
+fn len_of(item: &OutputItem) -> usize {
+    match item {
+        OutputItem::Text(text) | OutputItem::Console(text) => text.len(),
+    }
+}
+
+/// Resolve a script-supplied tool name to a canonical path: the exact path,
+/// then a normalized identifier alias (pi's `tools.my_tool` -> `my-tool`).
+fn canonical_tool_path(name: &str, tools: &BTreeMap<String, SandboxTool>) -> Option<String> {
+    if tools.contains_key(name) {
+        return Some(name.to_owned());
+    }
+    tools
+        .keys()
+        .find(|known| normalize_identifier(known) == name)
+        .cloned()
+}
+
+/// The `searchTools(query, { limit?, namespace? })` response: `{ name,
+/// description }[]` ranked by BM25 (pi's default limit 8). An empty query
+/// returns tools in path order, so scripts can browse a namespace.
+fn search_tools_response(
+    tools: &BTreeMap<String, SandboxTool>,
+    query: &str,
+    opts_json: &str,
+) -> String {
+    let options: Value = serde_json::from_str(opts_json).unwrap_or(json!({}));
+    let limit = options
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(8);
+    let namespace = options.get("namespace").and_then(Value::as_str);
+    let candidates: Vec<(&String, &SandboxTool)> = tools
+        .iter()
+        .filter(|(path, _)| {
+            namespace.is_none_or(|ns| path.starts_with(ns) && path[ns.len()..].starts_with('.'))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return "[]".to_owned();
+    }
+    let index = SearchIndex::build(candidates.iter().map(|(path, tool)| {
+        (
+            (*path).clone(),
+            tool.description.clone().unwrap_or_default(),
+            Vec::new(),
+        )
+    }));
+    let hits = index.search(query, limit);
+    let hits_json: Vec<Value> = hits
+        .iter()
+        .map(|hit| json!({ "name": hit.name, "description": hit.description }))
+        .collect();
+    serde_json::to_string(&hits_json).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The `describeTool(name)` response: `{ name, description, declaration }` or
+/// `null` when the tool is unknown (the JS leaf maps `null` to `undefined`).
+fn describe_tool_response(tools: &BTreeMap<String, SandboxTool>, name: &str) -> String {
+    let Some(path) = canonical_tool_path(name, tools) else {
+        return "null".to_owned();
+    };
+    let tool = &tools[&path];
+    let response = json!({
+        "name": path,
+        "description": tool.description.clone().unwrap_or_default(),
+        "declaration": ts_declaration(
+            &path,
+            tool.description.as_deref(),
+            tool.input_schema.as_ref(),
+        ),
+    });
+    serde_json::to_string(&response).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// The `describeNamespace(name)` response: `{ name, tools: [...] }` for a
+/// path prefix, or `null` when no tool lives under it. Namespace-level
+/// descriptions and instructions are not tracked yet, so they are omitted.
+fn describe_namespace_response(tools: &BTreeMap<String, SandboxTool>, name: &str) -> String {
+    let prefix = format!("{name}.");
+    let members: Vec<&SandboxTool> = tools
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .map(|(_, tool)| tool)
+        .collect();
+    if members.is_empty() {
+        return "null".to_owned();
+    }
+    let tools_json: Vec<Value> = members
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description.clone().unwrap_or_default(),
+                "declaration": ts_declaration(
+                    &tool.name,
+                    tool.description.as_deref(),
+                    tool.input_schema.as_ref(),
+                ),
+            })
+        })
+        .collect();
+    let response = json!({ "name": name, "tools": tools_json });
+    serde_json::to_string(&response).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// Render a tool's TypeScript declaration (pi's `describeTool` shape): a doc
+/// comment with the description, and a function taking one typed `args`
+/// object. Without a schema the argument type is an open record.
+fn ts_declaration(name: &str, description: Option<&str>, schema: Option<&Value>) -> String {
+    let callable = name.rsplit('.').next().unwrap_or(name);
+    let callable = normalize_identifier(callable);
+    let args_type = match schema {
+        Some(schema) if schema.get("type").and_then(Value::as_str) == Some("object") => {
+            ts_object_type(schema)
+        }
+        _ => "{ [k: string]: unknown }".to_owned(),
+    };
+    match description {
+        Some(description) if !description.is_empty() => {
+            format!(
+                "/** {description} */\ndeclare function {callable}(args: {args_type}): Promise<unknown>;"
+            )
+        }
+        _ => format!("declare function {callable}(args: {args_type}): Promise<unknown>;"),
+    }
+}
+
+/// Render a JSON Schema object type as a TypeScript object type.
+fn ts_object_type(schema: &Value) -> String {
+    let properties = match schema.get("properties").and_then(Value::as_object) {
+        Some(properties) if !properties.is_empty() => properties,
+        _ => return "{ [k: string]: unknown }".to_owned(),
+    };
+    let members = ts_members(properties, schema);
+    if members.is_empty() {
+        "{ [k: string]: unknown }".to_owned()
+    } else {
+        format!("{{ {} }}", members.join(" "))
+    }
+}
+
+/// Render the members of an object schema: `name: type;` with `?` markers
+/// for properties absent from `required`, and doc comments when present.
+fn ts_members(properties: &serde_json::Map<String, Value>, schema: &Value) -> Vec<String> {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut members = Vec::new();
+    for (property, property_schema) in properties {
+        let optional = if required.contains(property) { "" } else { "?" };
+        let member_type = ts_type(property_schema);
+        let member = format!("{property}{optional}: {member_type};");
+        match property_schema
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+        {
+            Some(doc) => members.push(format!("/** {doc} */ {member}")),
+            None => members.push(member),
+        }
+    }
+    members
+}
+
+/// Render one JSON Schema value as a TypeScript type.
+fn ts_type(schema: &Value) -> String {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let literals: Vec<String> = values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "unknown".to_owned()))
+            .collect();
+        if !literals.is_empty() {
+            return literals.join(" | ");
+        }
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => "string".to_owned(),
+        Some("number" | "integer") => "number".to_owned(),
+        Some("boolean") => "boolean".to_owned(),
+        Some("null") => "null".to_owned(),
+        Some("array") => format!(
+            "{}[]",
+            schema
+                .get("items")
+                .map(ts_type)
+                .unwrap_or_else(|| "unknown".to_owned())
+        ),
+        Some("object") => match schema.get("properties").and_then(Value::as_object) {
+            Some(properties) if !properties.is_empty() => ts_object_type(schema),
+            _ => "Record<string, unknown>".to_owned(),
+        },
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// Render a [`ScriptResult`] as the text a host hands back to the model, in
+/// pi's codemode format: a `Script completed`/`Script failed` header with the
+/// wall time, text items (from `text()` and the return value) in order under
+/// `==> text N/M <==` markers when there are several, `console` lines in one
+/// `<console_output>` block, and `Script error:` last for failures. Output is
+/// truncated to the script's `max_output_tokens` budget, keeping its start
+/// and end (pi truncates the same way, but also saves the full text to a
+/// file; there is no file system here, so the full text is dropped).
+pub fn render_result_text(result: &ScriptResult) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    let mut all_text: Vec<String> = result
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Text(text) => Some(text.clone()),
+            OutputItem::Console(_) => None,
+        })
+        .collect();
+    // The return value joins the text items (pi: `return value` adds the
+    // value like `text()`).
+    if let Some(value) = &result.value {
+        all_text.push(serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()));
+    }
+    let multiple = all_text.len() > 1;
+    let total = all_text.len();
+    for (index, text) in all_text.iter().enumerate() {
+        if multiple {
+            sections.push(format!("==> text {}/{} <==", index + 1, total));
+        }
+        sections.push(text.clone());
+    }
+    let console_lines: Vec<&String> = result
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Console(line) => Some(line),
+            OutputItem::Text(_) => None,
+        })
+        .collect();
+    if !console_lines.is_empty() {
+        sections.push("<console_output>".to_owned());
+        sections.extend(console_lines.iter().map(|line| (*line).clone()));
+    }
+    if let Some(error) = &result.error {
+        sections.push(format!("Script error: {error}"));
+    }
+    let status = if result.ok { "completed" } else { "failed" };
+    let rendered = format!(
+        "Script {status} in {}ms\n{}",
+        result.duration_ms,
+        sections.join("\n")
+    );
+    truncate_to_budget(rendered, result.max_output_tokens)
+}
+
+/// Apply the `max_output_tokens` budget (estimated at 4 characters per
+/// token): over-budget output keeps its start and end around a marker.
+fn truncate_to_budget(rendered: String, max_output_tokens: u64) -> String {
+    let budget = max_output_tokens.saturating_mul(CHARS_PER_TOKEN as u64) as usize;
+    if rendered.len() <= budget {
+        return rendered;
+    }
+    let marker = format!("\n... [output truncated: kept start and end; budget {budget} chars]\n");
+    if budget <= marker.len() + 64 {
+        return rendered.chars().take(budget).collect();
+    }
+    let keep = budget - marker.len();
+    let head = keep - keep / 2;
+    let tail = keep / 2;
+    let head_text: String = rendered.chars().take(head).collect();
+    let total_chars = rendered.chars().count();
+    let tail_text: String = rendered.chars().skip(total_chars - tail).collect();
+    format!("{head_text}{marker}{tail_text}")
 }
 
 /// Map a plain rquickjs error into a sandbox error.
@@ -642,6 +1317,9 @@ pub mod server {
         pub path: String,
         /// Description shown in `ALL_TOOLS` / `searchTools`.
         pub description: Option<String>,
+        /// The tool's JSON Schema for its input, rendered into the TypeScript
+        /// declarations `describeTool` / `describeNamespace` return.
+        pub input_schema: Option<Value>,
         /// Async dispatcher: JSON args string → JSON result string.
         pub execute: ToolFn,
     }
@@ -657,10 +1335,12 @@ pub mod server {
             .map(|entry| {
                 let path = entry.path.clone();
                 let description = entry.tool.description.as_ref().map(|d| d.to_string());
+                let input_schema = Some(Value::Object((*entry.tool.input_schema).clone()));
                 let aggregator = std::sync::Arc::clone(&aggregator);
                 UpstreamTool {
                     path: path.clone(),
                     description,
+                    input_schema,
                     execute: Arc::new(move |args_json: String| {
                         let aggregator = std::sync::Arc::clone(&aggregator);
                         let path = path.clone();
@@ -729,20 +1409,26 @@ pub mod server {
         }
 
         /// The tool description shown to the model: the script environment's
-        /// TypeScript-flavored declaration, minus upstream tools (deferred by
-        /// default; the model finds them with `ALL_TOOLS`).
+        /// globals, minus upstream tools (deferred by default; the model
+        /// finds them with `searchTools` and `describeTool`).
         pub fn tool_definition() -> Tool {
             Tool::new(
                 CODEMODE_TOOL_NAME,
                 "Run a JavaScript script that calls tools. Upstream tools are available \
                  as `tools.<namespace>.<tool>(args)` returning promises; use \
                  `Promise.allSettled` to fan out and filter results before returning. \
-                 Discover tools with `ALL_TOOLS`. Only the script's return value, \
-                 `text()` output, and `console` lines reach the model — intermediate \
-                 tool results stay inside the script.\n\n\
-                 Globals: `tools.*`, `text(value)`, `console.log(...)`, `ALL_TOOLS`. \
-                 The script is the body of an async function: top-level `await` and \
-                 `return` work. No timers, network, or file system.",
+                 Only the script's return value, `text()` output, and `console` lines \
+                 reach the model — intermediate tool results stay inside the script.\n\n\
+                 The script may start with an options line: \
+                 `// @options: {\"max_output_tokens\": 2000, \"timeout_ms\": 60000}`.\n\n\
+                 Globals: `tools.*`, `text(value)`, `console.log(...)`, `exit()`, \
+                 `ALL_TOOLS` (every tool as `{ name, description }`), \
+                 `searchTools(query, { limit?, namespace? })` (BM25 ranking, \
+                 default limit 8), `describeTool(name)` (description plus \
+                 TypeScript declaration), `describeNamespace(name)`. The script \
+                 is the body of an async function: top-level `await` and `return` \
+                 work. No timers, network, or file system: a script waiting on a \
+                 promise nothing can settle fails immediately.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -776,11 +1462,15 @@ pub mod server {
                 let sandbox_tools: Vec<SandboxTool> = tools
                     .iter()
                     .map(|t| {
-                        SandboxTool::new(
+                        let tool = SandboxTool::new(
                             t.path.clone(),
                             t.description.clone().unwrap_or_default(),
                             Arc::clone(&t.execute),
-                        )
+                        );
+                        match &t.input_schema {
+                            Some(schema) => tool.with_input_schema(schema.clone()),
+                            None => tool,
+                        }
                     })
                     .collect();
                 let sandbox = Sandbox::with_memory_limit(memory_limit).await?;
@@ -790,26 +1480,10 @@ pub mod server {
                 .await
                 .map_err(|e| super::SandboxError::Engine(format!("script task failed: {e}")))??;
 
-            let mut content = Vec::new();
-            for item in &result.output {
-                let line = match item {
-                    super::OutputItem::Text(t) => t.clone(),
-                    super::OutputItem::Console(t) => format!("[console] {t}"),
-                };
-                content.push(ContentBlock::text(line));
-            }
-            if let Some(error) = &result.error {
-                content.push(ContentBlock::text(format!("Script failed: {error}")));
-            }
-            if let Some(value) = &result.value {
-                content.push(ContentBlock::text(format!(
-                    "Returned: {}",
-                    serde_json::to_string(value).unwrap_or_else(|_| "null".into())
-                )));
-            }
-            if content.is_empty() {
-                content.push(ContentBlock::text("(no output)"));
-            }
+            // pi's codemode result format: a header with the wall time, the
+            // script's text/console output, and `Script error:` on failure.
+            let text = super::render_result_text(&result);
+            let content = vec![ContentBlock::text(text)];
             if result.ok {
                 Ok(CallToolResult::success(content))
             } else {
