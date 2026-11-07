@@ -8,7 +8,9 @@ use rmcp::{
     service::{RoleClient, RoleServer, RunningService, ServerInitializeError, ServiceExt},
 };
 use rmcp_codemode::exposure::ToolExposure;
-use rmcp_codemode_quickjs::server::{CodemodeMode, CodemodeServer, UpstreamTool};
+use rmcp_codemode_quickjs::server::{
+    CodemodeMode, CodemodeServer, FileStorePersister, UpstreamTool,
+};
 use serde_json::{Value, json};
 
 /// A tool that echoes its arguments back as `{"echo": <args>}`.
@@ -25,6 +27,22 @@ fn echo_tool(path: &str, exposure: ToolExposure) -> UpstreamTool {
         execute: Arc::new(move |args_json: String| {
             Box::pin(async move {
                 serde_json::to_string(&json!({ "echo": args_json })).map_err(|e| e.to_string())
+            })
+        }),
+    }
+}
+
+/// A tool that resolves after `delay_ms` (for worker-pool timing tests).
+fn slow_tool(path: &str, exposure: ToolExposure, delay_ms: u64) -> UpstreamTool {
+    UpstreamTool {
+        path: path.to_owned(),
+        description: Some("Resolves after a delay".to_owned()),
+        input_schema: None,
+        exposure,
+        execute: Arc::new(move |_args_json: String| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Ok("\"late\"".to_owned())
             })
         }),
     }
@@ -264,4 +282,141 @@ async fn image_output_becomes_an_mcp_image_block() {
         .expect("image content block");
     assert_eq!(image.mime_type, "image/png");
     assert_eq!(image.data, "aGVsbG8=");
+}
+
+// ---- worker pool (pi: at most N workers, FIFO queue, bounded wait) ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn workers_run_scripts_in_parallel_up_to_the_limit() {
+    let server = CodemodeServer::new(vec![echo_tool("echo", ToolExposure::CodeModeOnly)])
+        .with_max_workers(2);
+    // Two scripts at once are fine with 2 workers.
+    let (a, b) = tokio::join!(
+        server.run_script("return \"a\";"),
+        server.run_script("return \"b\";"),
+    );
+    assert!(a.unwrap().content.iter().any(|c| c.as_text().is_some()));
+    assert!(b.unwrap().content.iter().any(|c| c.as_text().is_some()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scripts_beyond_the_worker_limit_wait_in_arrival_order() {
+    use std::time::Duration;
+    let server = CodemodeServer::new(vec![slow_tool("slow", ToolExposure::CodeModeOnly, 200)])
+        .with_max_workers(1)
+        .with_timeout(Duration::from_millis(500));
+    // First script occupies the only worker for ~200ms; the second queues
+    // behind it and still runs (within its 200ms wait cap).
+    let (a, b) = tokio::join!(
+        server.run_script("return await tools.slow({});"),
+        server.run_script("return \"queued and ran\";"),
+    );
+    assert!(a.unwrap().content.iter().any(|c| c.as_text().is_some()));
+    let b = b.unwrap();
+    assert!(
+        b.content.iter().any(|c| c
+            .as_text()
+            .is_some_and(|t| t.text.contains("queued and ran"))),
+        "second script should run after the first frees the worker"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_script_that_gets_no_worker_in_time_fails_without_running() {
+    use std::time::Duration;
+    let server = std::sync::Arc::new(
+        CodemodeServer::new(vec![slow_tool("slow", ToolExposure::CodeModeOnly, 300)])
+            .with_max_workers(1)
+            .with_worker_wait(Duration::from_millis(100)),
+    );
+    // Occupy the worker for 300ms; the queued script's 100ms wait expires.
+    let held = tokio::spawn({
+        let server = std::sync::Arc::clone(&server);
+        async move { server.run_script("return await tools.slow({});").await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let result = server.run_script("return \"never\";").await.unwrap();
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert!(text.contains("no codemode worker available"), "{text}");
+    let _ = held.await.unwrap().unwrap();
+}
+
+// ---- durable store (pi keeps the store in the session file) ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn store_survives_a_server_restart_through_a_persister() {
+    let dir = std::env::temp_dir().join(format!(
+        "codemode-store-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+
+    let persister = std::sync::Arc::new(FileStorePersister::new(&path));
+    let server = CodemodeServer::new(vec![echo_tool("echo", ToolExposure::CodeModeOnly)])
+        .with_store_persistence(persister);
+    let first = server
+        .run_script("store(\"session\", { id: 7 }); return \"stored\";")
+        .await
+        .unwrap();
+    assert!(first.is_error.is_none_or(|e| !e), "store run failed");
+    drop(server);
+
+    // A fresh server over the same persister sees the committed values.
+    let persister = std::sync::Arc::new(FileStorePersister::new(&path));
+    let server = CodemodeServer::new(vec![]).with_store_persistence(persister);
+    let second = server
+        .run_script("return load(\"session\");")
+        .await
+        .unwrap();
+    let text = second
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert!(text.contains("\"id\":7"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- overflow file wiring through the server ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_overflow_goes_to_the_configured_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "codemode-overflow-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = CodemodeServer::new(vec![]).with_overflow_dir(&dir);
+    let result = server
+        .run_script("// @options: {\"max_output_tokens\": 100}\nreturn \"z\".repeat(3000);")
+        .await
+        .unwrap();
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    let marker = "Full output: ";
+    let path_line = text
+        .lines()
+        .find(|l| l.starts_with(marker))
+        .expect("overflow path");
+    let path = std::path::PathBuf::from(&path_line[marker.len()..]);
+    assert!(path.starts_with(&dir), "{path:?}");
+    assert!(path.is_file());
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The host (and the model) sees exactly one tool:
+The host (and the model) sees exactly one tool. This is the whole integration for a host like Zed: connect upstream MCP servers (any rmcp transport — child process, HTTP, in-process), aggregate, serve. Everything below — sandboxing, discovery, exposure routing, result formatting — is the crate's job.
 
 ```json
 {"name": "codemode", "inputSchema": {"properties": {"script": {"type": "string"}}}}
@@ -88,17 +88,21 @@ text(`coldest: ${coldest.city} at ${coldest.celsius}C`);
 return { coldest: coldest.city };
 ```
 
-### The script environment
+### The script environment (pi's `codemode` globals)
 
 - The script is the body of an async function: top-level `await` and `return` work.
-- `tools.<namespace>.<tool>(args)` — every registered upstream tool, as namespaced promise-returning functions. Arguments and results make a JSON round trip. Unknown paths fail with an `Unknown tool` message plus registry suggestions.
-- `text(value)` — append a line to the result the model sees.
-- `console.log/info/warn/error/debug` — append `[console]` lines.
-- `ALL_TOOLS` — `{ name, description }` for every callable tool.
+- `tools.<namespace>.<tool>(args)` — every registered upstream tool, as namespaced promise-returning functions. Arguments and results make a JSON round trip. Unknown paths fail with an `Unknown tool` message plus close-match suggestions.
+- `text(value)`, `image(dataUri)` — append text / image items to the result the model sees.
+- `console.log/info/warn/error/debug` — append console lines (one `<console_output>` block).
+- `ALL_TOOLS` — `{ name, description }` for every callable tool, including ones the description does not list.
+- `searchTools(query, { limit?, namespace? })` — BM25-ranked discovery (default limit 8).
+- `describeTool(name)` / `describeNamespace(name)` — descriptions plus TypeScript declarations rendered from the tools' JSON Schemas.
+- `store(key, value)` / `load(key)` — small JSON values kept across codemode calls; writes commit only when the script succeeds, and a host can back them with its own session persistence (`with_store_persistence`).
+- `exit()` — ends the script successfully, even when a try/catch swallows it.
+- `// @options: {"max_output_tokens": ..., "timeout_ms": ...}` as the first line sets the output budget and the script's own deadline.
 - Nothing else: no timers, `fetch`, `require`, `process`, or file system. Scripts reach the outside world only through tool calls. The VM has a heap limit (256 MB default); allocations past it throw `InternalError: out of memory`.
-- Only the script's return value, `text()` output, and `console` lines reach the model. Tool calls before a failure are real and not undone.
 
-Each script runs in a fresh QuickJS VM (pi's model): a runaway or failed script cannot poison the next run.
+Each script runs in a fresh QuickJS VM (pi's model): a runaway or failed script cannot poison the next run, unawaited tool calls are cancelled when the script ends, and a script waiting on a promise nothing can settle fails immediately. Scripts beyond the worker limit (2 by default, `with_max_workers`) queue in arrival order and fail without running if no worker frees up in time. Over-budget output keeps its start and end; the full text is written to a file whose path is included in the result.
 
 ## Exposure model
 
@@ -156,8 +160,9 @@ Exposure states are observable at the server boundary (the mixing pi and OpenCod
 - `CodemodeMode::Only` (pi's `codemode.mode: "only"`, OpenCode 2.0's default) hides direct tools behind the codemode tool entirely.
 
 Known gaps:
-- One store per server (pi scopes stores per session/branch); `_meta` plumbing.
+- One store per server (pi scopes stores per session/branch — a host with sessions would key persisters itself); `_meta` plumbing.
 - The aggregator reconnects upstreams only by rebuilding.
+- Syntax-error messages carry no line numbers (QuickJS reports none; pi's Node runtime does).
 
 ## License
 

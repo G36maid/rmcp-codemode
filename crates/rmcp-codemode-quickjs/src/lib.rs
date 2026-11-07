@@ -270,8 +270,8 @@ fn extract_options(source: &str) -> (String, Result<ScriptOptions, String>) {
 
 /// The sandbox: one QuickJS runtime, reused across script executions.
 pub struct Sandbox {
-    runtime: AsyncRuntime,
-    context: AsyncContext,
+    /// Per-run VM heap limit in bytes.
+    memory_limit: usize,
     /// Namespace descriptions served to `describeNamespace`; set by the host
     /// (an aggregator knows its upstreams' descriptions).
     namespace_descriptions: Arc<BTreeMap<String, String>>,
@@ -289,15 +289,8 @@ impl Sandbox {
     /// Create a sandbox with an explicit VM heap limit in bytes. An allocation
     /// past the limit throws `InternalError: out of memory` inside the script.
     pub async fn with_memory_limit(limit: usize) -> Result<Self, SandboxError> {
-        let runtime = AsyncRuntime::new().map_err(|e| SandboxError::Engine(e.to_string()))?;
-        runtime.set_memory_limit(limit).await;
-        runtime.set_max_stack_size(1024 * 1024).await;
-        let context = AsyncContext::full(&runtime)
-            .await
-            .map_err(|e| SandboxError::Engine(e.to_string()))?;
         Ok(Self {
-            runtime,
-            context,
+            memory_limit: limit,
             namespace_descriptions: Arc::default(),
         })
     }
@@ -368,18 +361,29 @@ impl Sandbox {
         let pending_store: Arc<Mutex<BTreeMap<String, Value>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
 
+        // A fresh VM per script run (pi's model). The VM — runtime with its
+        // job queue included — drops at the end of this call, which cancels
+        // any upstream calls still in flight for promises the script did not
+        // await, and guarantees nothing from a previous run can leak into
+        // this one.
+        let runtime = AsyncRuntime::new().map_err(|e| SandboxError::Engine(e.to_string()))?;
+        runtime.set_memory_limit(self.memory_limit).await;
+        runtime.set_max_stack_size(1024 * 1024).await;
         // The interrupt handler gives the host two hard stops inside pure-JS
         // execution: the deadline, and a script's own exit() that a try/catch
         // swallowed.
         {
             let exit_requested = Arc::clone(&exit_requested);
-            self.runtime
+            runtime
                 .set_interrupt_handler(Some(Box::new(move || {
                     exit_requested.load(Ordering::Relaxed)
                         || deadline_instant.is_some_and(|d| Instant::now() >= d)
                 })))
                 .await;
         }
+        let context = AsyncContext::full(&runtime)
+            .await
+            .map_err(|e| SandboxError::Engine(e.to_string()))?;
 
         let mut tool_map: BTreeMap<String, SandboxTool> = BTreeMap::new();
         for tool in tools {
@@ -405,8 +409,7 @@ impl Sandbox {
         // and upstream tool calls included (the interrupt handler handles
         // pure-JS loops; this backstop covers hung upstream calls).
         let run = async {
-            let envelope: Value = self
-                .context
+            let envelope: Value = context
                 .async_with(async |ctx| {
                     run_script(
                         ctx,
@@ -424,7 +427,6 @@ impl Sandbox {
                     .await
                 })
                 .await?;
-            self.runtime.idle().await;
             Ok::<Value, SandboxError>(envelope)
         };
         let envelope = match deadline {
@@ -1368,6 +1370,45 @@ fn ts_type(schema: &Value) -> String {
 /// and end (pi truncates the same way, but also saves the full text to a
 /// file; there is no file system here, so the full text is dropped).
 pub fn render_result_text(result: &ScriptResult) -> String {
+    truncate_to_budget(render_sections(result), result.max_output_tokens)
+}
+
+/// Render a [`ScriptResult`] for the model, truncating at the script's
+/// `max_output_tokens` budget. When the full output exceeds the budget, it is
+/// written to `<overflow_dir>/codemode-output-<pid>-<nanos>.txt` and its path
+/// is included in the result (pi: "longer output keeps its start and end, and
+/// the full text is written to a temp file whose path is included in the
+/// result"). A host without a writable directory can use
+/// [`render_result_text`], which drops the overflow instead.
+pub fn render_result_text_with_overflow(
+    result: &ScriptResult,
+    overflow_dir: &std::path::Path,
+) -> String {
+    let full = render_sections(result);
+    let budget = result
+        .max_output_tokens
+        .saturating_mul(CHARS_PER_TOKEN as u64) as usize;
+    if full.len() <= budget {
+        return full;
+    }
+    let truncated = truncate_to_budget(full.clone(), result.max_output_tokens);
+    let path = overflow_dir.join(format!(
+        "codemode-output-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    match std::fs::write(&path, &full) {
+        Ok(()) => format!("{truncated}\nFull output: {}", path.display()),
+        Err(_) => truncated, // no writable directory: drop the overflow
+    }
+}
+
+/// The untruncated result rendering shared by [`render_result_text`] and
+/// [`render_result_text_with_overflow`].
+fn render_sections(result: &ScriptResult) -> String {
     let mut sections: Vec<String> = Vec::new();
     // Text and image items appear in output order (pi); the return value
     // joins as a final text item (pi: `return value` adds the value like
@@ -1430,12 +1471,11 @@ pub fn render_result_text(result: &ScriptResult) -> String {
         sections.push(format!("Script error: {error}"));
     }
     let status = if result.ok { "completed" } else { "failed" };
-    let rendered = format!(
+    format!(
         "Script {status} in {}ms\n{}",
         result.duration_ms,
         sections.join("\n")
-    );
-    truncate_to_budget(rendered, result.max_output_tokens)
+    )
 }
 
 /// Apply the `max_output_tokens` budget (estimated at 4 characters per
@@ -1602,6 +1642,67 @@ pub mod server {
         Only,
     }
 
+    /// How long a script may wait for a free worker before failing without
+    /// running (pi's constant). The effective cap is the smaller of this and
+    /// the script's own timeout.
+    pub const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The default worker count (pi: at most two codemode workers across all
+    /// sessions in one process), overridable via the `CODEMODE_MAX_WORKERS`
+    /// environment variable.
+    pub fn default_max_workers() -> usize {
+        std::env::var("CODEMODE_MAX_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2)
+    }
+
+    /// Durable storage for the script-visible [`Store`], so values survive a
+    /// process restart (pi persists the store into the session file; a Rust
+    /// host plugs its own session persistence in here).
+    pub trait StorePersister: Send + Sync {
+        /// Persist the full store; called after each script that committed
+        /// writes.
+        fn save(&self, store: &std::collections::BTreeMap<String, Value>);
+        /// Load the store at server construction.
+        fn load(&self) -> std::collections::BTreeMap<String, Value>;
+    }
+
+    /// A [`StorePersister`] that keeps the store in one JSON file, written
+    /// atomically (tmp file + rename).
+    pub struct FileStorePersister {
+        path: std::path::PathBuf,
+    }
+
+    impl FileStorePersister {
+        /// A persister backed by the JSON file at `path`.
+        pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+            Self { path: path.into() }
+        }
+    }
+
+    impl StorePersister for FileStorePersister {
+        fn save(&self, store: &std::collections::BTreeMap<String, Value>) {
+            let tmp = self.path.with_extension("json.tmp");
+            if serde_json::to_string_pretty(store)
+                .map_err(|_| ())
+                .and_then(|text| std::fs::write(&tmp, text).map_err(|_| ()))
+                .and_then(|()| std::fs::rename(&tmp, &self.path).map_err(|_| ()))
+                .is_err()
+            {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+
+        fn load(&self) -> std::collections::BTreeMap<String, Value> {
+            std::fs::read_to_string(&self.path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default()
+        }
+    }
+
     /// An upstream tool dispatcher wired into the sandbox.
     #[allow(clippy::exhaustive_structs)] // user-constructed by design
     pub struct UpstreamTool {
@@ -1678,18 +1779,30 @@ pub mod server {
         mode: CodemodeMode,
         namespace_descriptions: Arc<BTreeMap<String, String>>,
         store: Store,
+        /// Bounded concurrency for script VMs, acquired FIFO (pi's worker
+        /// pool: at most N workers alive, scripts queue in arrival order).
+        worker_semaphore: Arc<tokio::sync::Semaphore>,
+        worker_wait: std::time::Duration,
+        persister: Option<Arc<dyn StorePersister>>,
+        overflow_dir: std::path::PathBuf,
     }
 
     impl CodemodeServer {
         /// Create the server over a set of upstream tools.
         pub fn new(tools: Vec<UpstreamTool>) -> Self {
+            let persister: Option<Arc<dyn StorePersister>> = None;
+            let store = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::default()));
             Self {
                 tools: Arc::new(tools),
                 timeout: None,
                 memory_limit: super::DEFAULT_MEMORY_LIMIT,
                 mode: CodemodeMode::default(),
                 namespace_descriptions: Arc::default(),
-                store: Arc::default(),
+                store,
+                worker_semaphore: Arc::new(tokio::sync::Semaphore::new(default_max_workers())),
+                worker_wait: WORKER_WAIT,
+                persister,
+                overflow_dir: std::env::temp_dir(),
             }
         }
 
@@ -1718,6 +1831,38 @@ pub mod server {
         /// [`CodemodeMode::On`]).
         pub fn with_mode(mut self, mode: CodemodeMode) -> Self {
             self.mode = mode;
+            self
+        }
+
+        /// Persist the script store through `persister`: values are loaded at
+        /// construction and saved after each script that committed writes
+        /// (pi keeps the store in the session file; hosts plug in their own
+        /// session persistence).
+        pub fn with_store_persistence(mut self, persister: Arc<dyn StorePersister>) -> Self {
+            *self.store.lock().unwrap() = persister.load();
+            self.persister = Some(persister);
+            self
+        }
+
+        /// Set the worker-pool size: at most `max` script VMs run at once;
+        /// further scripts queue in arrival order (pi's worker pool).
+        pub fn with_max_workers(mut self, max: usize) -> Self {
+            self.worker_semaphore = Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+            self
+        }
+
+        /// Set how long a script may wait for a free worker before failing
+        /// without running (pi's 60 seconds). The effective cap is the
+        /// smaller of this and the script's own timeout.
+        pub fn with_worker_wait(mut self, wait: std::time::Duration) -> Self {
+            self.worker_wait = wait;
+            self
+        }
+
+        /// Set the directory where truncated scripts' full output is written
+        /// (default: the system temp directory).
+        pub fn with_overflow_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+            self.overflow_dir = dir.into();
             self
         }
 
@@ -1839,6 +1984,27 @@ pub mod server {
             &self,
             script: &str,
         ) -> Result<CallToolResult, super::SandboxError> {
+            // Worker pool (pi): at most N script VMs alive, scripts wait in
+            // arrival order; one that gets no worker within the wait cap (or
+            // before its own timeout) fails without running.
+            let wait_cap = self
+                .timeout
+                .map_or(self.worker_wait, |t| t.min(self.worker_wait));
+            let permit = match tokio::time::timeout(
+                wait_cap,
+                Arc::clone(&self.worker_semaphore).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Script failed: no codemode worker available within {}s",
+                        wait_cap.as_secs()
+                    ))]));
+                }
+            };
+
             let script = script.to_owned();
             let tools = Arc::clone(&self.tools);
             let timeout = self.timeout;
@@ -1866,15 +2032,32 @@ pub mod server {
                     .execute_with_store(&script, sandbox_tools, timeout, Some(&store))
                     .await
             });
-            let result = outcome
-                .await
-                .map_err(|e| super::SandboxError::Engine(format!("script task failed: {e}")))??;
+            let result = match outcome.await {
+                Ok(result) => result?,
+                Err(e) => {
+                    drop(permit);
+                    return Err(super::SandboxError::Engine(format!(
+                        "script task failed: {e}"
+                    )));
+                }
+            };
+            // The worker slot frees as soon as the VM is done, not when the
+            // result is rendered.
+            drop(permit);
+
+            // Persist committed store writes (pi keeps the store in the
+            // session file).
+            if let (true, Some(persister)) = (result.ok, &self.persister) {
+                persister.save(&self.store.lock().unwrap());
+            }
 
             // pi's codemode result format: a header with the wall time, the
             // script's text/console output, and `Script error:` on failure.
+            // Over-budget output keeps its start and end, and the full text
+            // is written to a file whose path is included in the result.
             // Images additionally become MCP image content blocks, in output
             // order after the text.
-            let text = super::render_result_text(&result);
+            let text = super::render_result_text_with_overflow(&result, &self.overflow_dir);
             let mut content = vec![ContentBlock::text(text)];
             for item in &result.output {
                 if let super::OutputItem::Image { data, mime_type } = item {

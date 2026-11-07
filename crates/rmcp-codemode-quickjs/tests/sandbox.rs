@@ -1046,3 +1046,81 @@ async fn describe_namespace_includes_host_description() {
     assert_eq!(namespace["description"], "The GitHub API");
     assert_eq!(namespace["name"], "github");
 }
+
+// ---- pi's runtime semantics: unawaited calls are cancelled ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn unawaited_tool_calls_are_cancelled_when_the_script_ends() {
+    // pi: "calls still running when the script ends are cancelled, and
+    // unawaited promises are discarded." Returning while a 500ms call is in
+    // flight must not wait it out, and the cancelled call must not record.
+    let sandbox = Sandbox::new().await.unwrap();
+    let started = std::time::Instant::now();
+    let result = sandbox
+        .execute(
+            "tools.slow(); return \"early\";",
+            vec![slow_tool(
+                "slow",
+                "Resolves after a delay",
+                500,
+                json!("late"),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    assert_eq!(result.value, Some(json!("early")));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(300),
+        "the unawaited call must be cancelled, not waited out"
+    );
+    assert!(
+        result.calls.is_empty(),
+        "cancelled calls are not recorded: {:?}",
+        result.calls
+    );
+
+    // A fresh run on the same sandbox sees none of the stale job: no leaked
+    // call records, no late side effects.
+    let result = sandbox
+        .execute(
+            "return ALL_TOOLS.length;",
+            vec![],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.value, Some(json!(0)));
+}
+
+// ---- pi's overflow file: full output written, path included ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn truncated_output_writes_the_full_text_to_a_file() {
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            "// @options: {\"max_output_tokens\": 100}\nreturn \"y\".repeat(2000);",
+            vec![],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir();
+    let rendered = rmcp_codemode_quickjs::render_result_text_with_overflow(&result, &dir);
+    let marker = "Full output: ";
+    let path_line = rendered
+        .lines()
+        .find(|l| l.starts_with(marker))
+        .expect("overflow path");
+    let path = std::path::PathBuf::from(&path_line[marker.len()..]);
+    let full = std::fs::read_to_string(&path).expect("overflow file readable");
+    // The file holds the *untruncated* rendering; the returned text is the
+    // truncated one plus the path line.
+    assert!(full.len() > 2000, "full output kept: {}", full.len());
+    assert!(full.contains("yyyyyyyyyy"));
+    assert!(rendered.contains("output truncated"));
+    assert!(rendered.len() < full.len());
+    std::fs::remove_file(&path).ok();
+}
