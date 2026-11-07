@@ -18,8 +18,8 @@ Code mode solves both problems in one mechanism: tool schemas stay out of the co
 
 | Crate | Purpose | Feature |
 |---|---|---|
-| `rmcp-codemode` | Core: [`ToolExposure`](crates/rmcp-codemode/src/exposure.rs), aggregated [`Registry`](crates/rmcp-codemode/src/registry.rs), BM25 [`SearchIndex`](crates/rmcp-codemode/src/search.rs), the [`Aggregator`](crates/rmcp-codemode/src/aggregate.rs) (connect upstreams → registry → dispatch) | — |
-| `rmcp-codemode-quickjs` | The QuickJS sandbox backend and the [`CodemodeServer`](crates/rmcp-codemode-quickjs/src/lib.rs): a drop-in `ServerHandler` exposing exactly one `codemode` tool | `codemode` backend |
+| `rmcp-codemode` | Core, engine-agnostic: [`ToolExposure`](crates/rmcp-codemode/src/exposure.rs), aggregated [`Registry`](crates/rmcp-codemode/src/registry.rs), BM25 [`SearchIndex`](crates/rmcp-codemode/src/search.rs), the [`Aggregator`](crates/rmcp-codemode/src/aggregate.rs), plus the script contract — [`ScriptResult`](crates/rmcp-codemode/src/result.rs) and its model-facing rendering, TypeScript [`signature`](crates/rmcp-codemode/src/signature.rs) rendering, and tool-path [`identity`](crates/rmcp-codemode/src/identity.rs) rules | — |
+| `rmcp-codemode-quickjs` | The QuickJS binding: the per-run VM ([`sandbox`](crates/rmcp-codemode-quickjs/src/sandbox.rs)), the globals [`bridge`](crates/rmcp-codemode-quickjs/src/bridge.rs), and the [`CodemodeServer`](crates/rmcp-codemode-quickjs/src/server.rs) — a drop-in `ServerHandler` exposing exactly one `codemode` tool | `codemode` backend |
 
 ## Usage
 

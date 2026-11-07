@@ -25,10 +25,20 @@
 
 pub mod aggregate;
 pub mod exposure;
+pub mod identity;
 pub mod registry;
+pub mod result;
 pub mod search;
+pub mod signature;
 
 pub use aggregate::{Aggregator, UpstreamConfig};
 pub use exposure::ToolExposure;
+pub use identity::{normalize_identifier, unknown_tool_message};
 pub use registry::{Registry, RegistryEntry};
+pub use result::{
+    DEFAULT_MAX_OUTPUT_TOKENS, MAX_OUTPUT_CALLS, MAX_OUTPUT_CHARS, OutputItem, ScriptOptions,
+    ScriptResult, ToolCall, len_of, parse_image_input, render_result_text,
+    render_result_text_with_overflow,
+};
 pub use search::{SearchHit, SearchIndex};
+pub use signature::ts_declaration;
