@@ -1,0 +1,17 @@
+[package]
+name = "codemode-demo"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rmcp-codemode = { workspace = true }
+rmcp-codemode-quickjs = { workspace = true }
+rmcp = { version = "3.9", default-features = false, features = ["client", "server", "transport-io"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true
