@@ -126,7 +126,13 @@ just test     # full suite
 
 ### Test provenance
 
-The sandbox conformance suite (`crates/rmcp-codemode-quickjs/tests/sandbox.rs`) ports scenarios from pi's `packages/codemode` `sandbox.test.ts`: JSON round trips, parallel `Promise.allSettled` fan-out, tool failures as JS errors, partial output on failure, the no-timers/no-fetch/no-process guarantee, deadline and memory limits, and `ALL_TOOLS`. Engine conformance (test262-class suites in OpenCode's repo) is deliberately not ported: QuickJS-NG ships its own ECMAScript conformance, which is why this crate embeds it instead of a custom interpreter subset.
+The sandbox conformance suite (`crates/rmcp-codemode-quickjs/tests/sandbox.rs`) ports scenarios from two sources:
+
+**pi `packages/codemode` `sandbox.test.ts`:** JSON round trips, parallel `Promise.all` fan-out, tool failures as catchable JS errors, partial output kept on failure, the no-timers/no-fetch/no-process guarantee, deadline and memory limits, `ALL_TOOLS`, normalized identifiers (`tools.my_tool` reaches `my-tool`), unknown-tool close-match suggestions (`websearch` → did you mean `web-search`), and the host-shaped `tools` object (`"echo" in tools`, `JSON.stringify(tools) === "{}"`).
+
+**OpenCode `packages/codemode` `tool-paths.test.ts`:** namespace enumeration (`Object.keys(tools.api)` lists child segments), non-callable namespaces, and blocked member names (`tools.issues.constructor`, `tools.prototype` resolve as real paths; `__proto__` poisoning and `Function.constructor` escapes stay inert).
+
+**Deliberately not ported:** OpenCode's `*test262*`/`parity`/`stdlib`/`promise`/`generator` suites (~500KB) test the ECMAScript conformance of their custom interpreter — QuickJS-NG ships its own conformance, which is why this crate embeds it. OpenCode's `limits.test.ts` caps (`MAX_STRING_LENGTH`, pending-promise budgets) are properties of their interpreter, not portable. pi's worker/`close()`/abort-signal lifecycle, `store`/`load` snapshots, and image output test host machinery this crate does not implement yet. pi's syntax-error line-number reporting is not portable as-is: QuickJS error messages carry no source location (a separate compile pass would be needed).
 
 ## Benchmarks (vs. pi / OpenCode)
 
