@@ -1,8 +1,9 @@
 //! Per-server exposure metadata.
 //!
-//! How a server's tools should be exposed to the model. The naming mirrors
-//! Codex's `ToolExposure::Direct | Deferred | CodeModeOnly` enum so the
-//! convention reads the same across hosts.
+//! How a server's tools should be exposed to the model. The three variants
+//! mirror the core of Codex's `ToolExposure` enum (which additionally has
+//! model-only and hidden surfaces) so the convention reads the same across
+//! hosts.
 
 use std::fmt;
 
