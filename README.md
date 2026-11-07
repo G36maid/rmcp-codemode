@@ -179,8 +179,8 @@ Different hosts and model vendors spell tool paths differently. The sandbox tree
 | Convention | Path for (`github`, `create_issue`) | Sandbox shape | Matches |
 |---|---|---|---|
 | `Namespaced` *(default)* | `github.create_issue` | nested; `Object.keys(tools.github)` enumerates | OpenCode |
-| `McpPrefixed` | `mcp__github__create_issue` | flat, one segment | Claude Code |
-| `Flat { separator }` | `github__create_issue` (with `__`) | flat | pi-style flattening |
+| `McpPrefixed` | `mcp__github__create_issue` | flat, one segment | pi, Claude Code |
+| `Flat { separator }` | `github__create_issue` (with `__`) | flat, no prefix | Cloudflare-style flattening |
 | `Custom(mapping)` | whatever the closure returns | follows the path's shape | anything else |
 
 The sandbox behaves identically in all cases — `ALL_TOOLS`, `searchTools`, close-match suggestions, and routing (the upstream always sees its own tool name) are spelling-agnostic. What differs: only `Namespaced` keeps namespace enumeration, namespace-scoped search, and per-namespace inline declarations, which is why it is the default.
