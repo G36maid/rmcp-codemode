@@ -330,3 +330,237 @@ async fn memory_limit_raises_out_of_memory() {
         .unwrap();
     assert!(!result.ok);
 }
+
+// ---- Ported: pi sandbox.test.ts + OpenCode tool-paths.test.ts ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn normalized_identifiers_reach_dashed_paths() {
+    // Ported from pi's "exposes tools under normalized identifiers": a tool
+    // registered as `my-tool` is callable as `tools.my_tool` and as
+    // `tools["my-tool"]`; a flat identifier alias works too.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            return {
+                dashed: await tools.my_tool(),
+                bracket: await tools["my-tool"],
+            };
+            "#
+            .replace("tools[\"my-tool\"]", "await tools[\"my-tool\"]()")
+            .as_str(),
+            vec![sync_tool("my-tool", "Dashes", json!("dash"))],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    assert_eq!(
+        result.value,
+        Some(json!({"dashed": "dash", "bracket": "dash"}))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_tools_uses_canonical_paths() {
+    // pi lists identifier names in ALL_TOOLS; our registry paths are already
+    // valid namespace access, so ALL_TOOLS mirrors the canonical paths.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            "return ALL_TOOLS.map((t) => t.name);",
+            vec![
+                sync_tool("github.list_issues", "List issues", json!(null)),
+                sync_tool("my-tool", "Dashes", json!(null)),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.value, Some(json!(["github.list_issues", "my-tool"])));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_tool_names_close_match() {
+    // Ported from pi's "names close matches when a script reads a tool that
+    // does not exist": token overlap suggests the real path; no overlap lists
+    // what is available.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            try { await tools.websearch(); return "no error"; }
+            catch (e) { return e.message; }
+            "#,
+            vec![
+                sync_tool("echo", "Echo", json!(null)),
+                sync_tool("web-search", "Web search", json!(null)),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let message = result
+        .value
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(
+        message.contains("Did you mean 'web-search'?"),
+        "got: {message}"
+    );
+
+    let result = sandbox
+        .execute(
+            r#"
+            try { await tools.nothing(); return "no error"; }
+            catch (e) { return e.message; }
+            "#,
+            vec![
+                sync_tool("echo", "Echo", json!(null)),
+                sync_tool("web-search", "Web search", json!(null)),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let message = result
+        .value
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(
+        message.contains("Available: echo, web-search."),
+        "got: {message}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn in_operator_and_tojson_stay_host_shaped() {
+    // Ported from pi: `'echo' in tools` works, `JSON.stringify(tools)` is the
+    // empty object, and `tools.toString` is undefined.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            return [
+                "echo" in tools,
+                "nothing" in tools,
+                String(tools.toString),
+                JSON.stringify(tools),
+            ];
+            "#,
+            vec![sync_tool("echo", "Echo", json!(null))],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(json!([
+            true,
+            false,
+            "undefined", // String(tools.toString) — toString is undefined
+            "{}"
+        ]))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn namespaces_enumerate_children() {
+    // Ported from OpenCode tool-paths.test.ts: "intermediate segments
+    // enumerate like ordinary namespaces" — Object.keys on a namespace lists
+    // its child segments.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            return {
+                top: Object.keys(tools),
+                nested: Object.keys(tools.api),
+                leaf: Object.keys(tools.api.issues),
+            };
+            "#,
+            vec![
+                sync_tool("api.issues.list", "List issues", json!("listed")),
+                sync_tool("api.users.get", "Get user", json!("user")),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(json!({
+            "top": ["api"],
+            "nested": ["issues", "users"],
+            "leaf": ["list"],
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn namespace_without_own_tool_is_not_callable() {
+    // Ported from OpenCode tool-paths.test.ts: "a namespace without its own
+    // tool stays non-callable".
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            try { await tools.issues({}); return "no error"; }
+            catch (e) { return e.message; }
+            "#,
+            vec![sync_tool("issues.list", "List issues", json!(null))],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let message = result
+        .value
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(
+        message.contains("Tool 'issues' is not callable"),
+        "got: {message}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_member_names_never_break_paths() {
+    // Ported from OpenCode tool-paths.test.ts: tools may use names like
+    // `constructor` or `__proto__` because path segments never touch real
+    // properties, and a script cannot escape through Function.constructor.
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            const object = {};
+            object.__proto__ = { polluted: true };
+            let escape = "no throw";
+            try { ({}).constructor.constructor("return 1 + 1")(); } catch (e) { escape = "blocked"; }
+            return {
+                ctor: await tools.issues.constructor({}),
+                proto: await tools.prototype({}),
+                polluted: object.__proto__.polluted,
+                objectCtor: object.constructor === Object,
+                escape,
+            };
+            "#,
+            vec![
+                sync_tool("issues.constructor", "Constructor tool", json!("ctor")),
+                sync_tool("prototype", "Prototype tool", json!("proto")),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    assert_eq!(
+        result.value,
+        Some(json!({
+            "ctor": "ctor",
+            "proto": "proto",
+            "polluted": true,
+            "objectCtor": true,
+            "escape": "no throw",
+        }))
+    );
+}

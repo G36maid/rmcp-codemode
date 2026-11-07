@@ -341,7 +341,9 @@ fn setup_globals<'js>(
 
     // ---- tool dispatcher: (path, argsJson) -> envelope JSON string; the JS
     // leaf throws `new Error(envelope.error)` when the call failed, so the
-    // script sees clean messages (pi's semantics) ----
+    // script sees clean messages (pi's semantics). Lookup order: exact path,
+    // then normalized identifier aliases (pi's `my-tool` ↔ `tools.my_tool`),
+    // then a close-match suggestion (pi's "Did you mean"). ----
     {
         let calls = Arc::clone(&calls);
         let tools = Arc::clone(&tools);
@@ -352,22 +354,26 @@ fn setup_globals<'js>(
                 let dispatch =
                     async |calls: Arc<Mutex<Vec<ToolCall>>>,
                            tools: Arc<BTreeMap<String, SandboxTool>>| {
-                        let Some(tool) = tools.get(&path) else {
-                            // Suggest the closest known path so the model can self-correct.
-                            let suggestions: Vec<&str> = tools
+                        // Identifier aliases, first registration wins on collision
+                        // (pi's semantics: `tools.my_tool` reaches `my-tool`).
+                        let canonical = if tools.contains_key(&path) {
+                            Some(path.clone())
+                        } else {
+                            tools
                                 .keys()
-                                .filter(|known| known.split('.').next() == path.split('.').next())
-                                .take(3)
-                                .map(String::as_str)
-                                .collect();
-                            let hint = if suggestions.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" Known: {}", suggestions.join(", "))
-                            };
+                                .find(|known| normalize_identifier(known) == path)
+                                .cloned()
+                        };
+                        let Some(tool_path) = canonical else {
                             return Ok::<String, rquickjs::Error>(
-                            json!({ "ok": false, "error": format!("Unknown tool '{path}'.{hint}") }).to_string(),
-                        );
+                                json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
+                                    .to_string(),
+                            );
+                        };
+                        let path = tool_path;
+                        let Some(tool) = tools.get(&path) else {
+                            return Ok(json!({ "ok": false, "error": unknown_tool_message(&path, &tools) })
+                                .to_string());
                         };
                         // Validate the argument shape only when the script sent one;
                         // `JSON.stringify(undefined)` arrives as the string "undefined".
@@ -415,36 +421,72 @@ fn setup_globals<'js>(
 globalThis.__leafPaths = new Set(JSON.parse({tools_spec_literal}));
 globalThis.ALL_TOOLS = JSON.parse({all_tools_json});
 
-function __makeLeaf(path) {{
-    return async (args) => {{
-        const envelope = JSON.parse(await globalThis.__callTool(path, JSON.stringify(args === undefined ? null : args)));
-        if (!envelope.ok) throw new Error(envelope.error);
-        return envelope.value;
-    }};
-}}
-function __isNamespace(prefix) {{
+globalThis.__makeLeaf = (path) => async (args) => {{
+    const envelope = JSON.parse(await globalThis.__callTool(path, JSON.stringify(args === undefined ? null : args)));
+    if (!envelope.ok) throw new Error(envelope.error);
+    return envelope.value;
+}};
+globalThis.__isNamespace = (prefix) => {{
     for (const path of globalThis.__leafPaths) if (path.startsWith(prefix + ".")) return true;
     return false;
-}}
-globalThis.tools = new Proxy(function () {{}}, {{
-    get(_target, prop) {{
-        if (typeof prop !== "string" || prop === "then") return undefined;
-        return __resolvePath(prop);
-    }},
-}});
-function __resolvePath(path) {{
+}};
+// Props that fall through to undefined unless a real tool owns the name, so
+// `tools.toString` is undefined and JSON.stringify(tools) stays {{}} while a
+// tool named `constructor` or `__proto__` still resolves (OpenCode's
+// "blocked member names" semantics: real paths always win).
+globalThis.__reserved = new Set(["then", "toString", "valueOf", "toJSON", "call", "apply", "bind"]);
+// The top-level `tools` is an object (pi: JSON.stringify(tools) stays an
+// empty object);
+// nested namespaces are callable proxies (OpenCode: a namespace without its
+// own tool is not callable).
+globalThis.__resolvePath = (path) => {{
     if (globalThis.__leafPaths.has(path)) return __makeLeaf(path);
     if (__isNamespace(path)) return __makeNamespace(path);
     return __makeLeaf(path); // unknown leaf: __callTool reports it with suggestions
-}}
-function __makeNamespace(prefix) {{
-    return new Proxy(function () {{}}, {{
+}};
+globalThis.__childSegments = (prefix) => {{
+    const out = new Set();
+    const at = prefix === "" ? "" : prefix + ".";
+    for (const path of globalThis.__leafPaths) {{
+        if (!path.startsWith(at)) continue;
+        const rest = path.slice(at.length);
+        out.add(rest.split(".")[0]);
+    }}
+    return out;
+}};
+globalThis.__memberPath = (prefix, prop) => (prefix ? prefix + "." + prop : prop);
+globalThis.__objectHandler = (prefix) => ({{
         get(_target, prop) {{
-            if (typeof prop !== "string" || prop === "then") return undefined;
-            return __resolvePath(prefix + "." + prop);
+            if (typeof prop !== "string") return undefined;
+            if (__reserved.has(prop) && !globalThis.__leafPaths.has(__memberPath(prefix, prop))) return undefined;
+            return __resolvePath(__memberPath(prefix, prop));
+        }},
+        has(_target, prop) {{
+            if (typeof prop !== "string") return Reflect.has(_target, prop);
+            const path = __memberPath(prefix, prop);
+            return globalThis.__leafPaths.has(path) || __isNamespace(path) || Reflect.has(_target, prop);
+        }},
+        ownKeys(target) {{
+            return [...__childSegments(prefix), ...Reflect.ownKeys(target)];
+        }},
+        getOwnPropertyDescriptor(target, prop) {{
+            if (typeof prop === "string" && __childSegments(prefix).has(prop)) {{
+                return {{ value: __resolvePath(__memberPath(prefix, prop)), writable: true, enumerable: true, configurable: true }};
+            }}
+            return Reflect.getOwnPropertyDescriptor(target, prop);
         }},
     }});
-}}
+globalThis.__makeObjectNamespace = (prefix) => new Proxy({{}}, __objectHandler(prefix));
+globalThis.tools = __makeObjectNamespace("");
+globalThis.__makeNamespace = function (prefix) {{
+    return new Proxy(function () {{}}, {{
+        ...__objectHandler(prefix),
+        apply(_target, _this, args) {{
+            if (globalThis.__leafPaths.has(prefix)) return __makeLeaf(prefix).apply(null, args);
+            throw new Error(`Tool '${{prefix}}' is not callable`);
+        }},
+    }});
+}};
 
 globalThis.text = (value) => {{
     globalThis.__emitText(typeof value === "string" ? value : JSON.stringify(value));
@@ -474,6 +516,96 @@ globalThis.console.debug = globalThis.console.log;
 /// Map a plain rquickjs error into a sandbox error.
 fn rquickjs_error(err: rquickjs::Error) -> SandboxError {
     SandboxError::Engine(err.to_string())
+}
+
+/// Normalize a tool path into a valid JavaScript identifier (pi's
+/// `toCodemodeIdentifier`): characters that are not valid in identifiers
+/// become `_`, and a leading digit is prefixed so the result is a valid name.
+/// Dots become `_`, so `github.list_issues` is also reachable as
+/// `tools.github_list_issues`.
+fn normalize_identifier(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 1);
+    for ch in path.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// The error message for an unknown tool: a close-match suggestion when one
+/// exists (pi: "Did you mean tools.web_search?"), otherwise an availability
+/// list (pi: "Available: echo, web_search.").
+fn unknown_tool_message(path: &str, tools: &BTreeMap<String, SandboxTool>) -> String {
+    // Separator-insensitive identity first (pi: `websearch` suggests
+    // `web-search`), then shared-token scoring.
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let requested_squashed = squash(path);
+    if let Some(known) = tools
+        .keys()
+        .find(|known| squash(known) == requested_squashed)
+    {
+        return format!("Unknown tool '{path}'. Did you mean '{known}'?");
+    }
+    let requested = tokenize_path(path);
+    let mut best: Option<(&str, usize)> = None;
+    for known in tools.keys() {
+        let known_tokens = tokenize_path(known);
+        let shared = known_tokens
+            .iter()
+            .filter(|t| requested.contains(t))
+            .count();
+        let score = shared * 2;
+        if score > 0 && best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((known, score));
+        }
+    }
+    match best {
+        Some((known, _)) => format!("Unknown tool '{path}'. Did you mean '{known}'?"),
+        None => {
+            let available: Vec<&str> = tools.keys().take(3).map(String::as_str).collect();
+            if available.is_empty() {
+                format!("Unknown tool '{path}'. No tools are registered.")
+            } else {
+                format!(
+                    "Unknown tool '{path}'. Available: {}.",
+                    available.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// Split a tool path into lowercase word tokens: separators (`.`, `-`, `_`)
+/// and camelCase boundaries both split, so `websearch` shares the token
+/// `search` with `web-search` and `getZone` with `get_zone`.
+fn tokenize_path(path: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in path.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && current.chars().last().is_some_and(|c| c.is_lowercase()) {
+                tokens.push(std::mem::take(&mut current).to_lowercase());
+            }
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// The `codemode` MCP tool: what a host sees.
