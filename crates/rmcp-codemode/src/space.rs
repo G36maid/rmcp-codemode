@@ -25,6 +25,7 @@ use serde_json::Value;
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Exposure {
     /// In `tools/list` every turn (today's behavior).
     #[default]

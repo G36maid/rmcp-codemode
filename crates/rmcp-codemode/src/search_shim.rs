@@ -46,6 +46,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// One search hit: the tool's canonical path, description, and score.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SearchHit {
     /// The tool's canonical path.
     pub path: String,

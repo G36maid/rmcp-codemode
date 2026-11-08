@@ -89,6 +89,7 @@ impl Budget {
 /// script's voice (pi's split); a malformed line fails the run before the
 /// script executes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ScriptOptions {
     /// Overrides [`Budget::max_output_tokens`] for this run.
     pub max_output_tokens: Option<u64>,

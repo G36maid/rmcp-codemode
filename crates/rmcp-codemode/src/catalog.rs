@@ -28,6 +28,7 @@ use crate::{
 
 /// How listed tools are presented (pi's `codemode.mode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mode {
     /// Direct tools stay in `tools/list` and are additionally declared in
     /// the codemode description (pi's `on`, the default).
@@ -41,6 +42,7 @@ pub enum Mode {
 /// One search hit as the script sees it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct SearchItem {
     /// The tool's canonical path.
     pub name: String,
@@ -51,6 +53,7 @@ pub struct SearchItem {
 /// A paged search result (OpenCode's contract).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct SearchPage {
     /// This page's hits, in rank order.
     pub items: Vec<SearchItem>,
@@ -63,6 +66,7 @@ pub struct SearchPage {
 /// One tool's full model-facing description.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct DescribedTool {
     /// Canonical path.
     pub name: String,
@@ -78,6 +82,7 @@ pub struct DescribedTool {
 /// A namespace's model-facing description (pi's `describeNamespace` shape).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct DescribedNamespace {
     /// Canonical namespace key.
     pub name: String,
@@ -94,7 +99,7 @@ pub struct DescribedNamespace {
 /// What [`Catalog::describe`] found.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::exhaustive_enums)] // tool and namespace exhaust discovery
+#[non_exhaustive]
 pub enum Described {
     /// A single tool.
     Tool(DescribedTool),
@@ -119,7 +124,9 @@ struct CatalogGroup {
 /// The model-facing view over a [`Space`].
 pub struct Catalog<'a> {
     space: &'a Space,
-    budget: &'a Budget,
+    /// Kept for future budget-aware rendering (per-section cost ceilings);
+    /// the inline budget is currently pi's fixed default.
+    _budget: &'a Budget,
     index: SearchIndex,
 }
 
@@ -129,7 +136,7 @@ impl<'a> Catalog<'a> {
     pub fn new(space: &'a Space, budget: &'a Budget) -> Self {
         Self {
             space,
-            budget,
+            _budget: budget,
             index: space.search_index(),
         }
     }
@@ -197,13 +204,10 @@ impl<'a> Catalog<'a> {
                 .split_last()
                 .filter(|(_, rest)| !rest.is_empty())
                 .map(|(_, rest)| rest.join("."));
-            match key {
-                Some(namespace) => {
-                    if !namespace_order.contains(&namespace) {
-                        namespace_order.push(namespace.clone());
-                    }
-                }
-                None => {}
+            if let Some(namespace) = key
+                && !namespace_order.contains(&namespace)
+            {
+                namespace_order.push(namespace);
             }
         }
         namespace_order.sort();
@@ -232,12 +236,13 @@ impl<'a> Catalog<'a> {
                 .split_last()
                 .filter(|(_, rest)| !rest.is_empty())
                 .map(|(_, rest)| rest.join("."));
-            let group = match key {
-                Some(namespace) => groups
+            let group = if let Some(namespace) = key {
+                groups
                     .iter_mut()
                     .find(|group| matches!(&group.namespace, Some((name, _)) if name == &namespace))
-                    .expect("namespace group pre-registered"),
-                None => &mut groups[0],
+                    .expect("namespace group pre-registered")
+            } else {
+                &mut groups[0]
             };
             group.entries.push(entry);
         }

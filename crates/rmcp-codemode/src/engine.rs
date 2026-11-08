@@ -34,6 +34,7 @@ use crate::{
 /// Everything one run needs: the tool space it may call, the resource
 /// budgets, and the namespace metadata for discovery.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct RunContext {
     /// The tools the script may call and the namespaces they belong to.
     pub space: Space,
@@ -98,6 +99,7 @@ pub trait SuspendingEngine: Engine {
 }
 
 /// What the host decides for one yielded call.
+#[non_exhaustive]
 pub enum Decision {
     /// Run the tool now; the script receives its result.
     Allow,
@@ -106,6 +108,7 @@ pub enum Decision {
 }
 
 /// One tool call the script issued, awaiting the host's decision.
+#[non_exhaustive]
 pub struct HostCall {
     /// The engine's id for this call, unique within the run.
     pub id: u64,
@@ -118,6 +121,7 @@ pub struct HostCall {
 }
 
 /// The host's answer to a yielded call (pi's `CodemodeOutcome`).
+#[non_exhaustive]
 pub enum Outcome {
     /// The call resolved with this JSON value.
     Deliver(Value),
@@ -136,6 +140,7 @@ pub enum Outcome {
 
 /// A running host-controlled execution. Concrete: engines hand these out
 /// already driven by channels, so hosts need no generics.
+#[non_exhaustive]
 pub struct RunHandle {
     /// The next call the script issued, or `None` when the run ended.
     pub next_call: futures::channel::mpsc::Receiver<HostCall>,
@@ -152,6 +157,7 @@ pub struct RunHandle {
 /// calls; persistence is the host's job — this is JSON-serializable exactly
 /// so a session file can hold it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SuspendState {
     /// The script source, unchanged.
     pub code: String,
@@ -163,6 +169,7 @@ pub struct SuspendState {
 /// One answered call, recorded for replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct AnsweredCall {
     /// The call's engine id within the original run.
     pub id: u64,
@@ -175,6 +182,7 @@ pub struct AnsweredCall {
 /// A serializable outcome (the replayable subset of [`Outcome`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RecordedOutcome {
     /// The call resolved with this JSON value.
     Ok(Value),

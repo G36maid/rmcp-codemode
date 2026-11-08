@@ -14,6 +14,7 @@ use crate::budget::Budget;
 /// One output item, in the order the script produced it (pi's shape).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OutputItem {
     /// A text item from `text()` or the return value.
     Text {
@@ -37,6 +38,7 @@ pub enum OutputItem {
 /// One tool call the script made (pi's `CodemodeCall`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct CallRecord {
     /// The tool's canonical path, as the script named it (identifier form).
     pub name: String,
@@ -50,6 +52,7 @@ pub struct CallRecord {
 /// How one call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CallStatus {
     /// The call resolved.
     Ok,
@@ -62,6 +65,7 @@ pub enum CallStatus {
 /// Store writes a successful run committed (pi's `CodemodeStoreWrites`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub struct StoreWrites {
     /// Keys set by `store(key, value)`.
     pub set: Vec<(String, Value)>,
@@ -72,6 +76,7 @@ pub struct StoreWrites {
 /// What a run reported. `output` survives failures up to the failure; a
 /// successful run carries the store writes (pi's tagged result).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ScriptResult {
     /// Whether the script completed (returned, threw nothing, or `exit()`).
     pub ok: bool,
