@@ -14,7 +14,7 @@ use rmcp_codemode::{ToolHandle, Value};
 use serde_json::json;
 
 /// Decrement the in-flight counter when a dispatched call ends.
-struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+pub(crate) struct InFlightGuard(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);

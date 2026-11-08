@@ -21,8 +21,8 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use rmcp_codemode::{
-    Budget, Catalog, Exposure, Mode, Outcome, RunContext, Space, SuspendState, ToolFn, ToolHandle,
-    Value,
+    Budget, Catalog, Exposure, Mode, Outcome, RunContext, ScriptResult, Space, SuspendState,
+    ToolFn, ToolHandle, Value,
 };
 use serde_json::json;
 
@@ -153,6 +153,46 @@ pub struct CodemodeServer<E> {
     /// calls [`CodemodeServer::resume`] with the id after approval.
     suspended: Arc<Mutex<BTreeMap<String, SuspendState>>>,
     next_suspension: Arc<std::sync::atomic::AtomicU64>,
+    /// Admission control (pi's worker pool): at most `max_workers` scripts
+    /// run concurrently; the rest queue in arrival order and fail without
+    /// starting if no worker frees up within `worker_wait_ms`.
+    workers: Arc<WorkerPool>,
+}
+
+/// pi's worker pool: at most [`Budget::max_workers`] scripts run at once.
+/// The wait counts toward the script's deadline — a script that waits for
+/// another script holds nothing, so a bounded wait prevents deadlock.
+struct WorkerPool {
+    slots: Arc<tokio::sync::Semaphore>,
+    worker_wait_ms: u64,
+}
+
+impl WorkerPool {
+    fn new(max_workers: usize, worker_wait_ms: u64) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(max_workers.max(1))),
+            worker_wait_ms,
+        }
+    }
+
+    /// Reserve a slot, waiting at most `min(deadline, worker_wait_ms)` (pi:
+    /// the wait counts toward the script's deadline). `None` means no
+    /// worker became free in time.
+    async fn reserve(&self, deadline_ms: Option<u64>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let wait = match deadline_ms {
+            Some(deadline) => deadline.min(self.worker_wait_ms),
+            None => self.worker_wait_ms,
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(wait.max(1)),
+            tokio::sync::Semaphore::acquire_owned(Arc::clone(&self.slots)),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Some(permit),
+            _ => None,
+        }
+    }
 }
 
 impl<E> CodemodeServer<E>
@@ -163,6 +203,10 @@ where
     pub fn new(engine: E, space: Space) -> Self {
         Self {
             engine: Arc::new(engine),
+            workers: Arc::new(WorkerPool::new(
+                Budget::default().max_workers,
+                Budget::default().worker_wait_ms,
+            )),
             space: Arc::new(space),
             budget: Budget::default(),
             mode: Mode::default(),
@@ -182,8 +226,11 @@ where
         self
     }
 
-    /// Set the resource budgets.
+    /// Set the resource budgets. The worker pool is rebuilt from
+    /// `max_workers`/`worker_wait_ms` (pi: shared by every session in the
+    /// process, at most two codemode workers).
     pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.workers = Arc::new(WorkerPool::new(budget.max_workers, budget.worker_wait_ms));
         self.budget = budget;
         self
     }
@@ -274,6 +321,21 @@ where
     /// Run one script one-shot (public for hosts that want the result
     /// directly, e.g. the store test).
     pub async fn run_one_shot(&self, script: &str) -> Result<CallToolResult, McpError> {
+        // pi: the wait for a worker counts toward the script's deadline,
+        // and a script that never gets one fails without starting.
+        let Some(_permit) = self.workers.reserve(self.budget.timeout_ms).await else {
+            return Ok(self.result_to_call_result(&ScriptResult::failed(
+                format!(
+                    "No codemode worker became free within {} seconds. All {} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                    self.budget.worker_wait_ms as f64 / 1000.0,
+                    self.budget.max_workers
+                )
+                .to_owned()
+                + "\n\nThe script did not start.",
+                self.budget.max_output_tokens,
+                0,
+            )));
+        };
         let result = self
             .engine
             .execute(script, &self.run_context())
@@ -287,6 +349,19 @@ where
     /// `requires_approval` (CF's annotations). The run's state is stored
     /// under a returned id; [`CodemodeServer::resume`] continues it.
     pub async fn run_with_approval(&self, script: &str) -> Result<CallToolResult, McpError> {
+        let Some(_permit) = self.workers.reserve(self.budget.timeout_ms).await else {
+            return Ok(self.result_to_call_result(&ScriptResult::failed(
+                format!(
+                    "No codemode worker became free within {} seconds. All {} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                    self.budget.worker_wait_ms as f64 / 1000.0,
+                    self.budget.max_workers
+                )
+                .to_owned()
+                + "\n\nThe script did not start.",
+                self.budget.max_output_tokens,
+                0,
+            )));
+        };
         let mut handle = self
             .engine
             .start(script, &self.run_context())

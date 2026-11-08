@@ -129,9 +129,18 @@ impl QuickJsEngine {
                         Some(sink) => Arc::clone(sink),
                         None => {
                             let sink_dispatcher = dispatcher.clone();
+                            let sink_in_flight = Arc::clone(&in_flight);
                             Arc::new(move |tool: ToolHandle, args: Value| {
                                 let dispatcher = sink_dispatcher.clone();
-                                Box::pin(async move { dispatcher.dispatch(&tool, args).await })
+                                let in_flight = Arc::clone(&sink_in_flight);
+                                Box::pin(async move {
+                                    // Inline execution is a pending tool call: the
+                                    // never-settling detector must not fire while a
+                                    // slow tool runs.
+                                    in_flight.fetch_add(1, Ordering::Relaxed);
+                                    let _guard = crate::run::InFlightGuard(Arc::clone(&in_flight));
+                                    dispatcher.dispatch(&tool, args).await
+                                })
                             })
                         }
                     };
@@ -242,11 +251,19 @@ impl SuspendingQuickJsEngine {
         let budget = context.budget.clone();
         let context = context.clone();
         tokio::spawn(async move {
-            let sink: crate::proxy::AsyncCallSink =
+            let sink: crate::proxy::AsyncCallSink = {
+                let sink_in_flight = Arc::clone(&in_flight);
                 Arc::new(move |tool: ToolHandle, args: Value| {
                     let dispatcher = sink_dispatcher.clone();
-                    Box::pin(async move { dispatcher.dispatch(&tool, args).await })
-                });
+                    let in_flight = Arc::clone(&sink_in_flight);
+                    Box::pin(async move {
+                        // Inline execution is a pending tool call (see run_with).
+                        in_flight.fetch_add(1, Ordering::Relaxed);
+                        let _guard = crate::run::InFlightGuard(Arc::clone(&in_flight));
+                        dispatcher.dispatch(&tool, args).await
+                    })
+                })
+            };
             let result = engine
                 .run_with_sink(&state.code, &context, replay, Some(sink), in_flight)
                 .await;

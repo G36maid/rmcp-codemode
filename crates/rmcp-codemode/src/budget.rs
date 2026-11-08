@@ -78,6 +78,12 @@ impl Budget {
         self
     }
 
+    /// The default budget with one field overridden.
+    pub fn with_worker_wait_ms(mut self, ms: u64) -> Self {
+        self.worker_wait_ms = ms;
+        self
+    }
+
     /// The output budget in characters.
     pub fn output_char_budget(&self) -> usize {
         self.max_output_tokens

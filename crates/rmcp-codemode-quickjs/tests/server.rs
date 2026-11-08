@@ -10,6 +10,20 @@ use rmcp_codemode::{Exposure, Space, ToolHandle};
 use rmcp_codemode_quickjs::{CodemodeServer, NativeTool, QuickJsEngine, SuspendingQuickJsEngine};
 use serde_json::{Value, json};
 
+fn sleeping_tool(path: &str, ms: u64, result: Value) -> ToolHandle {
+    ToolHandle::new(
+        path.split('.').map(str::to_owned).collect(),
+        format!("Sleeps {ms}ms then echoes"),
+        Arc::new(move |_| {
+            let result = result.clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                Ok(result.clone())
+            }) as rmcp_codemode::ToolFnFut
+        }),
+    )
+}
+
 fn echo_tool(path: &str, result: Value) -> ToolHandle {
     ToolHandle::new(
         path.split('.').map(str::to_owned).collect(),
@@ -226,4 +240,86 @@ fn value_of(result: CallToolResponse) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_scripts_admit_in_order_when_workers_free() {
+    // Two workers (the default): both start, queue nothing, both finish.
+    let space = Space::new();
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    );
+    let (client, _task) = host_client(server).await;
+    let scripts: Vec<_> = (0..2)
+        .map(|i| script_args(&format!("return {i};")))
+        .collect();
+    let results = futures_join(scripts, client).await;
+    assert!(results.iter().all(|r| !r.is_error.unwrap_or(false)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_wait_times_out_without_running_the_script() {
+    use rmcp_codemode::Budget;
+
+    // One worker held by a script that waits forever on a host call; the
+    // second script must fail without starting, with pi's message.
+    let mut space = Space::new();
+    space
+        .insert(sleeping_tool("slow.ping", 1_000, json!("pong")))
+        .unwrap();
+    let budget = Budget::default()
+        .with_max_workers(1)
+        .with_worker_wait_ms(300)
+        .with_timeout_ms(10_000);
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    )
+    .with_budget(budget);
+    let (client, _task) = host_client(server).await;
+
+    // Holder: a tool that sleeps 1s keeps the one worker busy.
+    let holder_client = client.clone();
+    let holder = tokio::spawn(async move {
+        holder_client
+            .call_tool(script_args("await tools.slow.ping({});"))
+            .await
+            .expect("holder call")
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let victim = client
+        .call_tool(script_args("return 1;"))
+        .await
+        .expect("victim call");
+    let text = result_text(&victim);
+    assert!(victim.is_error.unwrap_or(false), "victim must fail: {text}");
+    assert!(
+        text.contains("No codemode worker became free within 0.3 seconds"),
+        "{text}"
+    );
+    assert!(text.contains("The script did not start"), "{text}");
+    holder.abort();
+    let _ = holder.await;
+}
+
+/// Fire several codemode calls concurrently through one client.
+async fn futures_join(
+    scripts: Vec<CallToolRequestParams>,
+    client: RunningService<RoleClient, ()>,
+) -> Vec<CallToolResult> {
+    let peer = client.peer().clone();
+    let handles: Vec<_> = scripts
+        .into_iter()
+        .map(|params| {
+            let peer = peer.clone();
+            tokio::spawn(async move { peer.call_tool(params).await.expect("call") })
+        })
+        .collect();
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.expect("task"));
+    }
+    results
 }
