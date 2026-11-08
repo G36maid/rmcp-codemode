@@ -15,7 +15,11 @@
 #![deny(missing_docs)]
 
 pub mod engine;
-pub mod proxy;
+mod proxy;
 mod run;
+pub mod server;
 
 pub use engine::{QuickJsEngine, SuspendingQuickJsEngine};
+pub use server::{
+    CodemodeServer, FileStorePersister, NativeTool, ServerMode, Store, StorePersister,
+};

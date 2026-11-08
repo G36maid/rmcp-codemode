@@ -233,28 +233,20 @@ pub(crate) async fn execute_script(
     let mut envelope: Value = serde_json::from_str(&envelope)
         .map_err(|e| rmcp_codemode::EngineError::Engine(format!("bad result envelope: {e}")))?;
     // The IIFE's rejection handler can catch the interrupt as a normal JS
-    // rejection; classify the envelope error too.
-    if envelope.get("ok").and_then(Value::as_bool) == Some(false) {
-        if let Some(message) = envelope.get("error").and_then(Value::as_str) {
-            envelope["error"] = json!(classify_deadline(message.to_owned(), deadline_instant));
-        }
+    // rejection; classify the envelope error too (QuickJS's interrupt is
+    // InternalError("interrupted"); a passed deadline reports pi's timeout
+    // kind).
+    if envelope.get("ok").and_then(Value::as_bool) == Some(false)
+        && let Some(message) = envelope.get("error").and_then(Value::as_str)
+    {
+        envelope["error"] = json!(classify_deadline(message.to_owned(), deadline_instant));
     }
-    // QuickJS's interrupt error is an InternalError("interrupted") that the
-    // promise machinery surfaces as a normal rejection; when the deadline
-    // expired, report the deadline (pi's timeout kind).
     Ok(envelope)
 }
 
 /// QuickJS's interrupt error is `InternalError("interrupted")`; when the
 /// deadline expired, report the deadline (pi's timeout kind).
 fn classify_deadline(message: String, deadline_instant: Option<std::time::Instant>) -> String {
-    if std::env::var("CODEMODE_DEBUG").is_ok() {
-        eprintln!(
-            "DBG classify: message={:?} expired={}",
-            message,
-            deadline_instant.is_some_and(|d| std::time::Instant::now() >= d)
-        );
-    }
     if message == "interrupted" && deadline_instant.is_some_and(|d| std::time::Instant::now() >= d)
     {
         "script exceeded its deadline".to_owned()

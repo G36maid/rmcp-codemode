@@ -33,7 +33,9 @@ pub mod search_shim;
 pub mod signature;
 pub mod space;
 
-pub use budget::{Budget, ScriptOptions, extract_options};
+pub use budget::{
+    Budget, STORE_MAX_TOTAL_CHARS, STORE_MAX_VALUE_CHARS, ScriptOptions, extract_options,
+};
 pub use catalog::{Catalog, Described, Mode};
 pub use engine::{
     AnsweredCall, Decision, Engine, EngineError, HostCall, Outcome, RecordedOutcome, RunContext,

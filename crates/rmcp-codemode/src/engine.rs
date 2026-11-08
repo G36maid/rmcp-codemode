@@ -22,6 +22,8 @@
 //! engine yields every tool call to the host instead of executing it, so the
 //! host can allow, deny, pause, or record.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,6 +43,9 @@ pub struct RunContext {
     /// Resource budgets. The script's `@options` override
     /// [`Budget::max_output_tokens`] and [`Budget::timeout_ms`].
     pub budget: Budget,
+    /// The committed script store (`load` reads it; `store` writes commit
+    /// here on success). Empty unless the host persists state.
+    pub store: BTreeMap<String, Value>,
 }
 
 impl RunContext {
@@ -49,7 +54,20 @@ impl RunContext {
         Self {
             space,
             budget: Budget::default(),
+            store: BTreeMap::new(),
         }
+    }
+
+    /// Set the committed store (`load`'s initial view).
+    pub fn with_store(mut self, store: BTreeMap<String, Value>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Override the host budget.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Apply the script's `@options` on top of the host budget (the

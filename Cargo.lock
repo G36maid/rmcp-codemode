@@ -546,6 +546,7 @@ name = "rmcp-codemode-quickjs"
 version = "0.2.0"
 dependencies = [
  "futures",
+ "rmcp",
  "rmcp-codemode",
  "rquickjs",
  "serde_json",

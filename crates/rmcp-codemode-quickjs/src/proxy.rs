@@ -35,6 +35,7 @@ pub(crate) type AsyncCallSink = Arc<
 ///
 /// `pending_call` is the sink the dispatcher yields calls to (one-shot runs
 /// execute them inline; suspending runs forward them to the host).
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one setup, many globals
 pub(crate) fn setup(
     ctx: &rquickjs::Ctx<'_>,
@@ -46,6 +47,8 @@ pub(crate) fn setup(
     call_counter: &Arc<AtomicU64>,
     exit_requested: &Arc<AtomicBool>,
     dispatcher_sink: &AsyncCallSink,
+    initial_store: &Arc<Mutex<BTreeMap<String, Value>>>,
+    pending_store: &Arc<Mutex<BTreeMap<String, Value>>>,
 ) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
 
@@ -213,6 +216,67 @@ pub(crate) fn setup(
             "__describeNamespace",
             Func::from(move |name: String| -> String {
                 describe_namespace_response(&space, &namespaces, &name)
+            }),
+        )?;
+    }
+
+    // ---- store: reads see the run's initial snapshot; writes buffer in
+    // pending_store and commit on success (pi's split) ----
+    {
+        let pending_store = Arc::clone(pending_store);
+        let exit_requested = Arc::clone(exit_requested);
+        globals.set(
+            "__storeValue",
+            Func::from(
+                move |key: String, value_json: String, is_delete: bool| -> String {
+                    if exit_requested.load(Ordering::Relaxed) {
+                        return "script has exited".to_owned();
+                    }
+                    let mut pending = pending_store.lock().unwrap();
+                    if is_delete {
+                        pending.insert(key, Value::Null);
+                        return String::new();
+                    }
+                    if value_json.len() > rmcp_codemode::STORE_MAX_VALUE_CHARS {
+                        return format!(
+                            "store limit exceeded: one value may hold at most {} characters of JSON",
+                            rmcp_codemode::STORE_MAX_VALUE_CHARS
+                        );
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(&value_json) else {
+                        return "store() failed to encode the value".to_owned();
+                    };
+                    let total: usize = pending
+                        .values()
+                        .map(|v| serde_json::to_string(v).map_or(0, |s| s.len()))
+                        .sum();
+                    if total > rmcp_codemode::STORE_MAX_TOTAL_CHARS {
+                        return format!(
+                            "store limit exceeded: all values together may hold at most {} characters of JSON",
+                            rmcp_codemode::STORE_MAX_TOTAL_CHARS
+                        );
+                    }
+                    pending.insert(key, value);
+                    String::new()
+                },
+            ),
+        )?;
+    }
+    {
+        let initial_store = Arc::clone(initial_store);
+        let pending_store = Arc::clone(pending_store);
+        globals.set(
+            "__loadValue",
+            Func::from(move |key: String| -> String {
+                if let Some(value) = pending_store.lock().unwrap().get(&key) {
+                    return serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+                }
+                match initial_store.lock().unwrap().get(&key) {
+                    Some(value) => {
+                        serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+                    }
+                    None => "null".to_owned(),
+                }
             }),
         )?;
     }

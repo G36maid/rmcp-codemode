@@ -23,6 +23,7 @@ use rquickjs::{AsyncContext, AsyncRuntime};
 use crate::run::Dispatcher;
 
 /// The one-shot engine.
+#[non_exhaustive]
 pub struct QuickJsEngine {
     /// Where truncated output spills (pi: a temp file whose path is
     /// included in the result).
@@ -95,6 +96,13 @@ impl QuickJsEngine {
 
         let output: Arc<Mutex<Vec<OutputItem>>> = Arc::new(Mutex::new(Vec::new()));
         let calls: Arc<Mutex<Vec<rmcp_codemode::CallRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        // pi's store: reads see the initial snapshot, writes buffer and
+        // commit only on success.
+        let committed_store: Arc<Mutex<BTreeMap<String, Value>>> =
+            Arc::new(Mutex::new(context.store.clone()));
+        let initial_store = Arc::clone(&committed_store);
+        let pending_store: Arc<Mutex<BTreeMap<String, Value>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
         let call_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let exit_requested = Arc::new(AtomicBool::new(false));
 
@@ -137,6 +145,8 @@ impl QuickJsEngine {
                         &call_counter,
                         &exit_requested,
                         &sink,
+                        &initial_store,
+                        &pending_store,
                     );
                     if let Err(error) = result {
                         return Err(EngineError::Engine(error.to_string()));
@@ -160,7 +170,7 @@ impl QuickJsEngine {
             None => run.await?,
         };
 
-        let mut result = finalize(envelope, &output, &calls);
+        let mut result = finalize(envelope, &output, &calls, &pending_store, &committed_store);
         if exit_requested.load(Ordering::Relaxed) {
             result.ok = true;
             result.error = None;
@@ -289,10 +299,13 @@ fn namespace_metas(space: &Space) -> BTreeMap<String, rmcp_codemode::NamespaceMe
 }
 
 /// Build the final [`ScriptResult`] from the envelope and side channels.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     envelope: Value,
     output: &Arc<Mutex<Vec<OutputItem>>>,
     calls: &Arc<Mutex<Vec<rmcp_codemode::CallRecord>>>,
+    pending_store: &Arc<Mutex<BTreeMap<String, Value>>>,
+    committed_store: &Arc<Mutex<BTreeMap<String, Value>>>,
 ) -> ScriptResult {
     let ok = envelope.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let value = envelope.get("value").cloned().filter(|v| !v.is_null());
@@ -301,12 +314,32 @@ fn finalize(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .filter(|_| !ok);
+    // Commit buffered store writes on success (pi's semantics).
+    let store_writes = if ok {
+        let mut pending = pending_store.lock().unwrap();
+        let mut writes = rmcp_codemode::StoreWrites::default();
+        for (key, value) in std::mem::take(&mut *pending) {
+            if value.is_null() {
+                writes.delete.push(key);
+            } else {
+                committed_store
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), value.clone());
+                writes.set.push((key, value));
+            }
+        }
+        writes
+    } else {
+        Default::default()
+    };
     let mut result = ScriptResult::default();
     result.ok = ok;
     result.value = value;
     result.error = error;
     result.output = std::mem::take(&mut *output.lock().unwrap());
     result.calls = std::mem::take(&mut *calls.lock().unwrap());
+    result.store_writes = store_writes;
     result
 }
 

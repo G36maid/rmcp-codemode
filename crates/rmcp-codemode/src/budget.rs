@@ -85,6 +85,12 @@ impl Budget {
     }
 }
 
+/// Maximum characters of JSON for one stored value (pi's cap).
+pub const STORE_MAX_VALUE_CHARS: usize = 262_144;
+
+/// Maximum characters of JSON across all stored values (pi's cap).
+pub const STORE_MAX_TOTAL_CHARS: usize = 1_048_576;
+
 /// The script's `// @options:` first line. Only these two fields are the
 /// script's voice (pi's split); a malformed line fails the run before the
 /// script executes.
