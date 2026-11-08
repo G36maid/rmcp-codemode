@@ -2,18 +2,19 @@
 //! outputs pipe together, served as one `codemode` tool, then driven by a
 //! real host client so you can see exactly what the model sees.
 
-use std::sync::Arc;
-
 use rmcp::{
     ErrorData as McpError,
     handler::server::ServerHandler,
     model::{
-        CallToolRequestParams, CallToolRequestParams as Params, CallToolResponse, CallToolResult,
-        ContentBlock, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+        PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer, ServiceExt},
 };
-use rmcp_codemode::{Space, ToolHandle};
+use rmcp_codemode::{
+    Space,
+    upstream::{UpstreamOptions, space_from_peer},
+};
 use rmcp_codemode_quickjs::{
     QuickJsEngine,
     server::{CodemodeServer, NativeTool},
@@ -92,67 +93,34 @@ impl ServerHandler for WeatherServer {
     }
 }
 
-/// Connect the weather server as an upstream and return its tool handles.
-async fn weather_upstream() -> Result<Vec<ToolHandle>, Box<dyn std::error::Error>> {
-    let weather = Arc::new(WeatherServer);
+/// Connect the weather server as an upstream: one call ingests its tools
+/// into the space and attaches its handshake instructions.
+async fn connect_weather() -> Result<Space, Box<dyn std::error::Error>> {
     let (client_transport, server_transport) = tokio::io::duplex(16 * 1024);
-    let task = tokio::spawn(async move { weather.serve(server_transport).await });
+    let task = tokio::spawn(async move { WeatherServer.serve(server_transport).await });
     let client = ().serve(client_transport).await?;
     let peer = client.peer().clone();
-    // Keep both connection sides alive for the process lifetime.
-    tokio::spawn(async move {
-        let _ = client.waiting().await;
-        let _ = task.await;
-    });
 
-    let mut tools = Vec::new();
-    for tool in peer.list_all_tools().await? {
-        let peer = peer.clone();
-        let name = tool.name.to_string();
-        tools.push(ToolHandle::new(
-            format!("weather.{name}")
-                .split('.')
-                .map(str::to_owned)
-                .collect(),
-            tool.description.clone().unwrap_or_default(),
-            Arc::new(move |args| {
-                let peer = peer.clone();
-                let name = name.clone();
-                Box::pin(async move {
-                    let result = peer
-                        .call_tool(
-                            Params::new(name)
-                                .with_arguments(args.as_object().cloned().unwrap_or_default()),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let text = result
-                        .content
-                        .first()
-                        .and_then(|c| c.as_text())
-                        .map(|t| t.text.clone())
-                        .unwrap_or_default();
-                    serde_json::from_str(&text)
-                        .map_err(|error| format!("upstream returned invalid JSON: {error}"))
-                })
-            }),
-        ));
-    }
-    Ok(tools)
+    // One call: tools become weather.*, instructions attach from the
+    // handshake, exposure defaults to CodeModeOnly.
+    let space = space_from_peer(
+        &peer,
+        UpstreamOptions::new("weather").with_description("Weather lookups (Celsius)"),
+    )
+    .await?;
+
+    // Tool calls hold peer clones, but the connection's two sides must
+    // outlive the process for this in-process demo, so leak the keepalives.
+    std::mem::forget(client);
+    std::mem::forget(task);
+    Ok(space)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. The upstream's tools enter the space; the server's handshake
-    //    instructions become the namespace guidance.
-    let mut space = Space::new();
-    space.set_namespace(
-        "weather".into(),
-        rmcp_codemode::NamespaceMeta::with_description("Weather lookups (Celsius)"),
-    );
-    for tool in weather_upstream().await? {
-        space.insert(tool)?;
-    }
+    // 1. The upstream's tools enter the space in one call; the server's
+    //    handshake instructions become the namespace guidance.
+    let space = connect_weather().await?;
 
     // 2. A host-native tool joins the same way.
     let native = NativeTool::new("shout", "Uppercase a message", |args| {

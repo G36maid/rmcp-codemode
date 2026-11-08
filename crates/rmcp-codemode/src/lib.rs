@@ -32,6 +32,7 @@ pub mod result;
 pub mod search_shim;
 pub mod signature;
 pub mod space;
+pub mod upstream;
 
 pub use budget::{
     Budget, STORE_MAX_TOTAL_CHARS, STORE_MAX_VALUE_CHARS, ScriptOptions, extract_options,
