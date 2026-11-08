@@ -1,46 +1,52 @@
-//! Code mode for RMCP.
+//! The engine-agnostic codemode core.
 //!
-//! This crate implements the third-party reference crate proposed in
-//! [modelcontextprotocol/rust-sdk#1437](https://github.com/modelcontextprotocol/rust-sdk/issues/1437):
-//! a client-side aggregator that connects to N upstream MCP servers, merges their
-//! tools into one registry, and exposes them to any host as a `codemode` script
-//! tool — the model writes a script, upstream tools run inside a sandbox, and only
-//! the script's output reaches the model.
+//! Code mode lets a model write a script that calls tools, so intermediate
+//! results stay inside the script and tool schemas stay out of the context.
+//! The semantics are the union of three shipped designs, expressed as one
+//! model instead of glued pieces:
 //!
-//! # Primitives
+//! - **pi** (`@earendil-works/pi-codemode` + the coding-agent extension):
+//!   the script contract (globals, `@options`, output caps, result format,
+//!   worker admission, close-match guards), namespace metadata
+//!   (`ToolNamespace` with descriptions, instructions, aliases), the
+//!   catalog's round-robin inline budget, host-controlled runs
+//!   (`start()`/`deliver()`), and deterministic replay (virtual clock +
+//!   seeded PRNG + fingerprint).
+//! - **OpenCode** (`@opencode/codemode`): the tool space as a hierarchical
+//!   record — path segments are namespaces, namespace descriptions
+//!   participate in search, discovery is paged (`{ items, remaining, next }`).
+//! - **Cloudflare** (`@cloudflare/codemode`): the connector as a namespace
+//!   (`name()`/`instructions()`/`tool()` decoration), per-tool approval and
+//!   revert annotations, the durable call log's states, and snippets.
 //!
-//! - [`ToolExposure`] — per-server exposure metadata (`direct` / `deferred` /
-//!   `codemode`), mirroring Codex's `ToolExposure` enum and pi's `exposure` field.
-//! - [`registry`] — the aggregated tool registry with namespaces and exposure.
-//! - [`search`] — BM25 tool search, the discovery primitive for deferred tools.
-//! - [`aggregate`] — the client-side aggregation interface: connect upstreams →
-//!   aggregated registry → dispatch.
-//!
-//! Semantics follow pi's shipped `codemode` tool
-//! ([docs](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/codemode.md))
-//! with OpenCode's [`packages/codemode`](https://github.com/anomalyco/opencode/blob/dev/packages/codemode)
-//! as the second reference for the aggregation side.
+//! Everything here is engine-agnostic. [`engine`] defines what a script
+//! backend must honor; `rmcp-codemode-quickjs` is the reference backend.
 
 #![deny(missing_docs)]
 
-pub mod aggregate;
-pub mod exposure;
+pub mod budget;
+pub mod catalog;
+pub mod engine;
 pub mod identity;
-pub mod naming;
-pub mod registry;
 pub mod result;
-pub mod search;
+pub mod search_shim;
 pub mod signature;
+pub mod space;
 
-pub use aggregate::{Aggregator, UpstreamConfig};
-pub use exposure::ToolExposure;
-pub use identity::{normalize_identifier, unknown_tool_message};
-pub use naming::NamingConvention;
-pub use registry::{NamespaceInfo, Registry, RegistryEntry};
+pub use budget::Budget;
+pub use catalog::{Catalog, Described, Mode};
+pub use engine::{Engine, HostCall, Outcome, RunContext, RunHandle, SuspendState};
 pub use result::{
-    DEFAULT_MAX_OUTPUT_TOKENS, MAX_OUTPUT_CALLS, MAX_OUTPUT_CHARS, OutputItem, ScriptOptions,
-    ScriptResult, ToolCall, len_of, parse_image_input, render_result_text,
+    CallRecord, OutputItem, ScriptResult, StoreWrites, render_result_text,
     render_result_text_with_overflow,
 };
-pub use search::{SearchHit, SearchIndex};
-pub use signature::ts_declaration;
+/// What a script's call may resolve to, as the host answers a [`HostCall`].
+///
+/// A rejection becomes an `Error` with `message` inside the script, carrying
+/// the own properties of `properties` (pi's outcome properties, so hosts can
+/// attach structured data such as `structuredOutput`).
+pub use serde_json::Value;
+pub use space::{
+    Exposure, NamespaceMeta, Space, ToolAnnotations, ToolFn, ToolHandle, flat_identifier,
+    resolve_path, validate_segments,
+};

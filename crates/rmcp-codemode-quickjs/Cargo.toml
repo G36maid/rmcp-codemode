@@ -1,21 +1,15 @@
 [package]
 name = "rmcp-codemode-quickjs"
-license.workspace = true
+description = "QuickJS engine for rmcp-codemode: sandbox, suspending runs, deterministic replay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/G36maid/rmcp-codemode"
-readme = "README.md"
-description = "QuickJS script sandbox backend for rmcp-codemode"
 keywords.workspace = true
 categories.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
-rmcp = { version = "3.9", default-features = false, features = ["client", "server"] }
 rmcp-codemode = { workspace = true }
 rquickjs = { version = "0.14", features = ["futures", "rust-alloc", "parallel"] }
 serde_json = "1"
@@ -25,3 +19,6 @@ futures = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

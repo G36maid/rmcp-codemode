@@ -1,13 +1,16 @@
-//! Tool-path identity rules.
+//! Tool-path identity rules: script identifiers, close-match suggestions.
 //!
-//! How a registry path is spelled as a script identifier and how unknown
-//! names get self-correction suggestions. Engine-agnostic.
+//! pi's rules, shared by every view: characters outside identifiers become
+//! `_` (pi's `toCodemodeIdentifier`), and an unknown name fails with the
+//! closest real names (pi's guard: separator-insensitive exact forms first,
+//! then two-way substring matches, up to five suggestions, else a short
+//! availability list, plus the `in`-check hint).
 
 /// Normalize a tool path into a valid JavaScript identifier (pi's
 /// `toCodemodeIdentifier`): characters that are not valid in identifiers
-/// become `_`, and a leading digit is prefixed so the result is a valid name.
-/// Dots become `_`, so `github.list_issues` is also reachable as
-/// `tools.github_list_issues`.
+/// become `_`, and a leading digit is prefixed so the result is valid.
+/// Dots become `_`, so `github.create_issue` also reaches as
+/// `tools.github_create_issue`.
 pub fn normalize_identifier(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 1);
     for ch in path.chars() {
@@ -23,60 +26,91 @@ pub fn normalize_identifier(path: &str) -> String {
     out
 }
 
-/// The error message for an unknown tool: a close-match suggestion when one
-/// exists (pi: "Did you mean tools.web_search?"), otherwise an availability
-/// list (pi: "Available: echo, web_search.").
-pub fn unknown_tool_message(path: &str, names: &[String]) -> String {
-    // Separator-insensitive identity first (pi: `websearch` suggests
-    // `web-search`), then shared-token scoring.
-    let squash = |s: &str| -> String {
-        s.chars()
-            .filter(|c| c.is_alphanumeric())
+/// pi's guard text for a member that does not exist: close matches first
+/// (separator-insensitive identity, then two-way substring containment, up
+/// to five), else an availability list when the set is small, always ending
+/// with the `in`-check hint that lets a script verify before calling.
+pub fn unknown_member_message(label: &str, property: &str, names: &[String], hint: &str) -> String {
+    let comparable = |name: &str| -> String {
+        name.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
             .collect::<String>()
             .to_lowercase()
     };
-    let requested_squashed = squash(path);
-    if let Some(known) = names
+    let wanted = comparable(property);
+    let exact: Vec<&String> = names
         .iter()
-        .find(|known| squash(known) == requested_squashed)
-    {
-        return format!("Unknown tool '{path}'. Did you mean '{known}'?");
-    }
-    let requested = tokenize_path(path);
-    let mut best: Option<(&str, usize)> = None;
-    for known in names {
-        let known_tokens = tokenize_path(known);
-        let shared = known_tokens
+        .filter(|name| comparable(name) == wanted)
+        .collect();
+    let close: Vec<&String> = if exact.is_empty() {
+        names
             .iter()
-            .filter(|t| requested.contains(t))
-            .count();
-        let score = shared * 2;
-        if score > 0 && best.is_none_or(|(_, best_score)| score > best_score) {
-            best = Some((known, score));
-        }
+            .filter(|name| {
+                let candidate = comparable(name);
+                !wanted.is_empty() && (candidate.contains(&wanted) || wanted.contains(&candidate))
+            })
+            .collect()
+    } else {
+        exact
+    };
+    let mut message = format!("{label}.{property} does not exist.");
+    if !close.is_empty() {
+        let suggestions: Vec<String> = close
+            .iter()
+            .take(5)
+            .map(|name| format!("{label}.{name}"))
+            .collect();
+        message.push_str(&format!(" Did you mean {}?", suggestions.join(", ")));
+    } else if names.len() <= 20 {
+        message.push_str(&format!(" Available: {}.", names.join(", ")));
     }
-    match best {
-        Some((known, _)) => format!("Unknown tool '{path}'. Did you mean '{known}'?"),
-        None => {
-            let available: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
-            if available.is_empty() {
-                format!("Unknown tool '{path}'. No tools are registered.")
-            } else {
-                format!(
-                    "Unknown tool '{path}'. Available: {}.",
-                    available.join(", ")
-                )
-            }
-        }
+    if !hint.is_empty() {
+        message.push(' ');
+        message.push_str(hint);
     }
+    message.push_str(&format!(
+        " Check for a member with \"{}\" in {label}.",
+        property
+    ));
+    message
 }
-/// Split a tool path into lowercase word tokens: separators (`.`, `-`, `_`)
-/// and camelCase boundaries both split, so `websearch` shares the token
-/// `search` with `web-search` and `getZone` with `get_zone`.
-/// Split a tool path into lowercase word tokens: separators (`.`, `-`, `_`)
-/// and camelCase boundaries both split, so `websearch` shares the token
-/// `search` with `web-search` and `getZone` with `get_zone`. Delegates to
-/// [`crate::search::tokenize`] — one tokenizer serves BM25 and suggestions.
-pub(crate) fn tokenize_path(path: &str) -> Vec<String> {
-    crate::search::tokenize(path)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_like_pi() {
+        assert_eq!(
+            normalize_identifier("mcp__docs__search"),
+            "mcp__docs__search"
+        );
+        assert_eq!(normalize_identifier("my-tool"), "my_tool");
+        assert_eq!(
+            normalize_identifier("github.create_issue"),
+            "github_create_issue"
+        );
+        assert_eq!(normalize_identifier("9lives"), "_9lives");
+    }
+
+    #[test]
+    fn guard_suggests_close_matches_like_pi() {
+        let names: Vec<String> = ["web_search", "web_fetch"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let message = unknown_member_message("tools", "websearch", &names, "hint");
+        assert!(
+            message.contains("Did you mean tools.web_search?"),
+            "{message}"
+        );
+        assert!(message.ends_with("Check for a member with \"websearch\" in tools."));
+    }
+
+    #[test]
+    fn guard_lists_availability_for_small_sets() {
+        let names: Vec<String> = vec!["echo".to_owned(), "read".to_owned()];
+        let message = unknown_member_message("tools", "nothing", &names, "");
+        assert!(message.contains("Available: echo, read."), "{message}");
+    }
 }
