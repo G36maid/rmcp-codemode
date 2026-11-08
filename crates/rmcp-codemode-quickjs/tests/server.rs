@@ -323,3 +323,117 @@ async fn futures_join(
     }
     results
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_mode_hides_direct_tools_behind_codemode() {
+    use rmcp_codemode::Exposure;
+
+    // A Direct tool with ServerMode::Only stays callable in scripts but
+    // leaves tools/list (pi's `codemode.mode: "only"`).
+    let mut space = Space::new();
+    let mut handle = echo_tool("weather.list_cities", json!(["berlin"]));
+    handle.exposure = Exposure::Direct;
+    space.insert(handle).unwrap();
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    )
+    .with_mode(rmcp_codemode_quickjs::server::ServerMode::Only);
+    let (client, _task) = host_client(server).await;
+
+    let listed = client.list_all_tools().await.expect("list");
+    assert_eq!(listed.len(), 1, "only codemode is listed: {listed:?}");
+    assert_eq!(listed[0].name, "codemode");
+
+    // The direct tool still routes natively when the host calls it
+    // (Only hides the listing; the host decided to expose it itself).
+    let result = client
+        .call_tool(CallToolRequestParams::new("weather.list_cities"))
+        .await
+        .expect("native call");
+    assert!(!result.is_error.unwrap_or(false), "{:?}", result.content);
+
+    // And it is callable from a script.
+    let script = client
+        .call_tool(script_args("return await tools.weather.list_cities({});"))
+        .await
+        .expect("script");
+    assert!(!script.is_error.unwrap_or(false), "{:?}", script.content);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_output_spills_to_the_overflow_file() {
+    use rmcp_codemode::Budget;
+
+    // Output beyond the budget is truncated in the result, with the full
+    // text written to a file whose path is included (pi's overflow file).
+    let space = Space::new();
+    let budget = Budget::default().with_max_output_tokens(50); // 200 chars
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    )
+    .with_budget(budget);
+    let (client, _task) = host_client(server).await;
+
+    let result = client
+        .call_tool(script_args(r#"text("x".repeat(1000)); return "done";"#))
+        .await
+        .expect("call");
+    let text = result_text(&result);
+    assert!(
+        text.len() < 1000,
+        "result must be truncated: {}",
+        text.len()
+    );
+    assert!(text.contains("Full output: "), "{text}");
+    let path = text
+        .split("Full output: ")
+        .nth(1)
+        .map(str::trim)
+        .expect("overflow path in result");
+    let full = std::fs::read_to_string(path).expect("overflow file exists");
+    assert!(
+        full.len() > 1000,
+        "the full text is spilled: {}",
+        full.len()
+    );
+    assert!(full.matches('x').count() >= 1000, "all 1000 x's present");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tool_call_limit_stops_the_script_with_partial_output() {
+    use rmcp_codemode::Budget;
+
+    // OpenCode's maxToolCalls: past the limit calls fail and the script
+    // finishes with its partial output (the limit is per-run).
+    let mut space = Space::new();
+    space.insert(echo_tool("slow.ping", json!("pong"))).unwrap();
+    let budget = Budget::default().with_max_tool_calls(2);
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    )
+    .with_budget(budget);
+    let (client, _task) = host_client(server).await;
+
+    let result = client
+        .call_tool(script_args(
+            r#"
+                for (let i = 0; i < 5; i++) {
+                    try { await tools.slow.ping({}); }
+                    catch (error) { text(`stopped at ${i}`); break; }
+                }
+                return "end";
+            "#,
+        ))
+        .await
+        .expect("call");
+    let text = result_text(&result);
+    assert!(text.contains("stopped at 2"), "{text}");
+    assert!(
+        text.contains(r#""value":"end""#) || text.contains("==> text"),
+        "{text}"
+    );
+}

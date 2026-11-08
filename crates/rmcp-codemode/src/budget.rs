@@ -84,6 +84,12 @@ impl Budget {
         self
     }
 
+    /// The default budget with one field overridden.
+    pub fn with_max_tool_calls(mut self, calls: usize) -> Self {
+        self.max_tool_calls = Some(calls);
+        self
+    }
+
     /// The output budget in characters.
     pub fn output_char_budget(&self) -> usize {
         self.max_output_tokens
