@@ -98,6 +98,19 @@ pub trait SuspendingEngine: Engine {
     ) -> impl Future<Output = Result<RunHandle, EngineError>> + Send;
 }
 
+impl HostCall {
+    /// A yielded call. Fields are public; this constructor keeps the
+    /// `#[non_exhaustive]` struct buildable outside the crate.
+    pub fn new(id: u64, name: String, args: Value, execute: ToolFn) -> Self {
+        Self {
+            id,
+            name,
+            args,
+            execute,
+        }
+    }
+}
+
 /// What the host decides for one yielded call.
 #[non_exhaustive]
 pub enum Decision {
@@ -118,6 +131,21 @@ pub struct HostCall {
     pub args: Value,
     /// The tool's dispatcher, for [`Decision::Allow`].
     pub execute: ToolFn,
+}
+
+impl RunHandle {
+    /// Assemble a run handle from its channel halves.
+    pub fn new(
+        next_call: futures::channel::mpsc::UnboundedReceiver<HostCall>,
+        deliveries: futures::channel::mpsc::UnboundedSender<(u64, Outcome)>,
+        result: futures::channel::oneshot::Receiver<ScriptResult>,
+    ) -> Self {
+        Self {
+            next_call,
+            deliveries,
+            result,
+        }
+    }
 }
 
 /// The host's answer to a yielded call (pi's `CodemodeOutcome`).
@@ -143,11 +171,10 @@ pub enum Outcome {
 #[non_exhaustive]
 pub struct RunHandle {
     /// The next call the script issued, or `None` when the run ended.
-    pub next_call: futures::channel::mpsc::Receiver<HostCall>,
-    /// Answers flow back to the engine through this sender; a dropped
-    /// receiver cancels the unanswered calls (pi: the record stays
-    /// `cancelled`).
-    pub deliveries: futures::channel::mpsc::Sender<(u64, Outcome)>,
+    pub next_call: futures::channel::mpsc::UnboundedReceiver<HostCall>,
+    /// Answers flow back to the engine; a dropped sender cancels the
+    /// unanswered calls (pi: the record stays `cancelled`).
+    pub deliveries: futures::channel::mpsc::UnboundedSender<(u64, Outcome)>,
     /// The run's result, once it ends.
     pub result: futures::channel::oneshot::Receiver<ScriptResult>,
 }
@@ -166,6 +193,16 @@ pub struct SuspendState {
     pub answered: Vec<AnsweredCall>,
 }
 
+impl SuspendState {
+    /// A state for `code` with the given answered calls.
+    pub fn new(code: impl Into<String>, answered: Vec<AnsweredCall>) -> Self {
+        Self {
+            code: code.into(),
+            answered,
+        }
+    }
+}
+
 /// One answered call, recorded for replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +214,24 @@ pub struct AnsweredCall {
     pub name: String,
     /// The recorded outcome.
     pub outcome: RecordedOutcome,
+}
+
+impl AnsweredCall {
+    /// A recorded call.
+    pub fn new(id: u64, name: impl Into<String>, outcome: RecordedOutcome) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            outcome,
+        }
+    }
+}
+
+impl RecordedOutcome {
+    /// A recorded success.
+    pub fn ok(value: Value) -> Self {
+        Self::Ok(value)
+    }
 }
 
 /// A serializable outcome (the replayable subset of [`Outcome`]).

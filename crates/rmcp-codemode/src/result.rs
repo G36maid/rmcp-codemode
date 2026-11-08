@@ -49,6 +49,17 @@ pub struct CallRecord {
     pub duration_ms: u64,
 }
 
+impl CallRecord {
+    /// A finished call.
+    pub fn finished(name: impl Into<String>, status: CallStatus, duration_ms: u64) -> Self {
+        Self {
+            name: name.into(),
+            status,
+            duration_ms,
+        }
+    }
+}
+
 /// How one call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +109,19 @@ pub struct ScriptResult {
     pub max_output_tokens: u64,
     /// The file holding the full output when truncation spilled it (pi).
     pub full_output_path: Option<String>,
+}
+
+impl ScriptResult {
+    /// A failed run with only an error message (before the script ran).
+    pub fn failed(message: impl Into<String>, max_output_tokens: u64, duration_ms: u64) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            max_output_tokens,
+            duration_ms,
+            ..Self::default()
+        }
+    }
 }
 
 /// Total characters of one item, for the output caps.

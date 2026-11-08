@@ -33,11 +33,15 @@ pub mod search_shim;
 pub mod signature;
 pub mod space;
 
-pub use budget::Budget;
+pub use budget::{Budget, ScriptOptions, extract_options};
 pub use catalog::{Catalog, Described, Mode};
-pub use engine::{Engine, HostCall, Outcome, RunContext, RunHandle, SuspendState};
+pub use engine::{
+    AnsweredCall, Decision, Engine, EngineError, HostCall, Outcome, RecordedOutcome, RunContext,
+    RunHandle, SuspendState, SuspendingEngine,
+};
+pub use identity::normalize_identifier;
 pub use result::{
-    CallRecord, OutputItem, ScriptResult, StoreWrites, render_result_text,
+    CallRecord, CallStatus, OutputItem, ScriptResult, StoreWrites, item_chars, render_result_text,
     render_result_text_with_overflow,
 };
 /// What a script's call may resolve to, as the host answers a [`HostCall`].
@@ -47,6 +51,6 @@ pub use result::{
 /// attach structured data such as `structuredOutput`).
 pub use serde_json::Value;
 pub use space::{
-    Exposure, NamespaceMeta, Space, ToolAnnotations, ToolFn, ToolHandle, flat_identifier,
-    resolve_path, validate_segments,
+    Exposure, NamespaceMeta, Space, ToolAnnotations, ToolFn, ToolFnFut, ToolHandle,
+    flat_identifier, resolve_path, validate_segments,
 };

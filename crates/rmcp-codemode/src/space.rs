@@ -133,11 +133,13 @@ impl SchemaInfo {
     }
 }
 
+/// The boxed future a tool dispatcher resolves with.
+pub type ToolFnFut = futures::future::BoxFuture<'static, Result<Value, String>>;
+
 /// The dispatcher a script's call reaches. Arguments and results cross as
 /// JSON values; an `Err` rejects inside the script with the tool's error
 /// text (pi's contract).
-pub type ToolFn =
-    Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, Result<Value, String>> + Send + Sync>;
+pub type ToolFn = Arc<dyn Fn(Value) -> ToolFnFut + Send + Sync>;
 
 /// One callable tool in the space.
 #[derive(Clone)]
