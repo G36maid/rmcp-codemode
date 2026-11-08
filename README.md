@@ -132,9 +132,9 @@ The script is the body of an async function: top-level `await` and `return` work
 | `image(dataUri)` | Append an image (base64 data URI) to the output; it also becomes an MCP image content block. |
 | `console.log/info/warn/error/debug` | Console lines, returned in one `<console_output>` block. |
 | `ALL_TOOLS` | `{ name, description }` for every callable tool, including ones the description does not list. |
-| `searchTools(query, { limit?, namespace? })` | BM25-ranked discovery over names and descriptions (default limit 8; empty query lists in path order). |
+| `searchTools(query, { limit?, namespace?, offset? })` | BM25-ranked discovery over names and descriptions, paged: `{ items, remaining, next }` (pi's default limit 8; empty query lists in path order). |
 | `describeTool(name)` | The tool's description and TypeScript declaration, rendered from its JSON Schema. |
-| `describeNamespace(name)` | A namespace's description and its tools' declarations. |
+| `describeNamespace(name)` | `{ name, description?, instructions?, tools }` (pi's shape) — resolves through the namespace's own name **and its aliases** (`describeNamespace("docs")` finds `mcp__docs`). |
 | `store(key, value)` / `load(key)` | Small JSON values kept across codemode calls; writes commit only when the script succeeds. Back it with your own session persistence via `with_store_persistence`. |
 | `exit()` | End the script successfully — even when a try/catch swallows it. |
 | `return value` | A top-level `return` adds the value like `text()`. |
@@ -212,6 +212,8 @@ Known gaps:
 
 - One store per server (pi scopes stores per session/branch — a host with sessions would key persisters itself); `_meta` plumbing.
 - The aggregator reconnects upstreams only by rebuilding.
+
+Namespace metadata follows pi's `ToolNamespace`: each namespace carries a `description` (shown in listings and search), `instructions` (longer usage guidance — automatically pulled from each upstream server's own handshake `instructions` field, like pi's `connection.instructions`), and `aliases` (so `describeNamespace("docs")` finds `mcp__docs`).
 - Native-tool executor errors do not carry typed codes unless the tool encodes them in its return value.
 - Syntax-error messages carry no line numbers (QuickJS reports none; pi's Node runtime does).
 

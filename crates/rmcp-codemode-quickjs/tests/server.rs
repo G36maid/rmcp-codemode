@@ -222,7 +222,7 @@ async fn sandbox_sees_every_tool_regardless_of_exposure() {
             .call_tool(script_args(
                 r#"
                 const names = ALL_TOOLS.map((t) => t.name);
-                const viaSearch = (await searchTools("issues")).map((h) => h.name);
+                const viaSearch = (await searchTools("issues")).items.map((h) => h.name);
                 const called = await tools.github.create_issue({ value: "x" });
                 return { names, viaSearch, called };
                 "#,
@@ -604,4 +604,115 @@ async fn claude_style_flat_paths_work_end_to_end() {
     assert_eq!(value["topSegments"], json!(["mcp__github__create_issue"]));
     // Routing strips the spelling: the upstream sees its own tool name.
     assert_eq!(value["called"]["created"], "create_issue");
+}
+
+// ---- namespace instructions and aliases (pi's ToolNamespace) ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn describe_namespace_carries_instructions_and_resolves_aliases() {
+    use rmcp_codemode::{
+        aggregate::{Aggregator, UpstreamConfig, UpstreamHandle},
+        naming::NamingConvention,
+    };
+
+    // A server that declares instructions in its handshake (like an MCP
+    // server's `instructions` field) and a dashed name, so the alias
+    // resolution (`mcp__weather` <- `weather`) is exercised.
+    struct WeatherWithInstructions;
+    impl rmcp::handler::server::ServerHandler for WeatherWithInstructions {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(Default::default())
+                .with_instructions("Ask about temperatures in Celsius.")
+        }
+        async fn list_tools(
+            &self,
+            _: Option<rmcp::model::PaginatedRequestParams>,
+            _: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            Ok(rmcp::model::ListToolsResult {
+                tools: vec![rmcp::model::Tool::new(
+                    "get_temperature",
+                    "Get a temperature",
+                    json!({ "type": "object", "properties": {} })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                )],
+                ..Default::default()
+            })
+        }
+        async fn call_tool(
+            &self,
+            _: rmcp::model::CallToolRequestParams,
+            _: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            Ok(rmcp::model::CallToolResponse::Complete(
+                rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    json!({ "celsius": 20 }).to_string(),
+                )]),
+            ))
+        }
+    }
+
+    // The host declares the namespace metadata (the aggregator auto-pulls
+    // the server's handshake instructions; aliases are host-supplied).
+    let server_meta = Arc::new(WeatherWithInstructions);
+    let mut aggregator = {
+        use rmcp::service::ServiceExt;
+        let server = Arc::clone(&server_meta);
+        Aggregator::builder()
+            .upstream(UpstreamConfig {
+                namespace: "mcp__weather".into(),
+                exposure: ToolExposure::CodeModeOnly,
+                description: Some("Weather tools".into()),
+                naming: NamingConvention::default(),
+                transport: move || {
+                    let server = Arc::clone(&server);
+                    async move {
+                        let (client_transport, server_transport) = tokio::io::duplex(8192);
+                        let task =
+                            tokio::spawn(async move { server.serve(server_transport).await });
+                        let client = ().serve(client_transport).await?;
+                        let peer = client.peer().clone();
+                        let keepalive = Box::pin(async move {
+                            let _ = client.waiting().await;
+                            let _ = task.await;
+                        });
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(UpstreamHandle::new(
+                            peer, keepalive,
+                        ))
+                    }
+                },
+            })
+            .connect()
+            .await
+            .unwrap()
+    };
+    // Alias: the friendly name finds the canonical namespace.
+    aggregator
+        .registry_mut()
+        .add_namespace_aliases("mcp__weather", &["weather".to_owned()]);
+    let codemode = CodemodeServer::from_aggregator(Arc::new(aggregator));
+    let (client, _task) = host_client(codemode).await;
+    let value = result_value(
+        client
+            .call_tool(script_args(
+                r#"
+                return {
+                    byAlias: await describeNamespace("weather"),
+                };
+                "#,
+            ))
+            .await
+            .unwrap(),
+    );
+    let namespace = &value["byAlias"];
+    assert_eq!(namespace["name"], "mcp__weather");
+    assert_eq!(namespace["description"], "Weather tools");
+    // The instructions came from the upstream server's handshake, not config.
+    assert_eq!(
+        namespace["instructions"],
+        "Ask about temperatures in Celsius."
+    );
+    assert_eq!(namespace["tools"].as_array().unwrap().len(), 1);
 }

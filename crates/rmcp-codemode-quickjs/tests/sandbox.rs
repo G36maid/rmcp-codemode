@@ -631,7 +631,7 @@ async fn search_tools_ranks_by_query() {
     let sandbox = Sandbox::new().await.unwrap();
     let result = sandbox
         .execute(
-            "return (await searchTools(\"web\")).map((h) => h.name);",
+            "return (await searchTools(\"web\")).items.map((h) => h.name);",
             vec![
                 sync_tool("echo", "Echo a value back", json!("echo")),
                 sync_tool("web-search", "Search the web", json!("s")),
@@ -655,9 +655,9 @@ async fn search_tools_limit_and_namespace_and_empty_query() {
         .execute(
             r#"
             return {
-                limited: (await searchTools("", { limit: 1 })).length,
-                empty: (await searchTools("")).map((h) => h.name),
-                namespace: (await searchTools("", { namespace: "github" })).map((h) => h.name),
+                limited: (await searchTools("", { limit: 1 })).items.length,
+                empty: (await searchTools("")).items.map((h) => h.name),
+                namespace: (await searchTools("", { namespace: "github" })).items.map((h) => h.name),
             };
             "#,
             vec![
@@ -1123,4 +1123,89 @@ async fn truncated_output_writes_the_full_text_to_a_file() {
     assert!(rendered.contains("output truncated"));
     assert!(rendered.len() < full.len());
     std::fs::remove_file(&path).ok();
+}
+
+// ---- pi's discovery semantics: paging, namespace instructions, aliases ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_tools_pages_with_offset_and_next() {
+    let sandbox = Sandbox::new().await.unwrap();
+    let result = sandbox
+        .execute(
+            r#"
+            const first = await searchTools("", { limit: 2 });
+            const second = first.next === null
+                ? { items: [], remaining: 0 }
+                : await searchTools("", { limit: 2, offset: first.next.offset ?? first.next });
+            return {
+                firstCount: first.items.length,
+                remaining: first.remaining,
+                firstNames: first.items.map((h) => h.name),
+                secondNames: second.items.map((h) => h.name),
+                noOverlap: !first.items.some((h) => second.items.some((g) => g.name === h.name)),
+            };
+            "#,
+            vec![
+                sync_tool("a.one", "First", json!(1)),
+                sync_tool("a.two", "Second", json!(2)),
+                sync_tool("b.three", "Third", json!(3)),
+            ],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    assert_eq!(
+        result.value,
+        Some(json!({
+            "firstCount": 2,
+            "remaining": 1,
+            "firstNames": ["a.one", "a.two"],
+            "secondNames": ["b.three"],
+            "noOverlap": true,
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn describe_namespace_returns_instructions_and_resolves_aliases() {
+    use std::collections::BTreeMap;
+    let mut sandbox = Sandbox::new().await.unwrap();
+    let mut infos = BTreeMap::new();
+    infos.insert(
+        "mcp__docs".to_owned(),
+        rmcp_codemode::NamespaceInfo {
+            description: Some("Documentation search".to_owned()),
+            instructions: Some("Use for repository documentation questions.".to_owned()),
+            aliases: vec!["docs".to_owned()],
+        },
+    );
+    sandbox.set_namespace_infos(infos);
+    let sandbox_ref = &sandbox;
+    let result = sandbox_ref
+        .execute(
+            r#"
+            return {
+                byAlias: await describeNamespace("docs"),
+                byCanonical: await describeNamespace("mcp__docs"),
+                byNormalized: await describeNamespace("mcp__docs".replaceAll("-", "_")),
+            };
+            "#,
+            vec![sync_tool("mcp__docs.search", "Search docs", json!(null))],
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "error: {:?}", result.error);
+    let value = result.value.unwrap();
+    for key in ["byAlias", "byCanonical", "byNormalized"] {
+        let namespace = &value[key];
+        assert_eq!(namespace["name"], "mcp__docs", "{key}");
+        assert_eq!(namespace["description"], "Documentation search", "{key}");
+        assert_eq!(
+            namespace["instructions"], "Use for repository documentation questions.",
+            "{key}"
+        );
+        assert_eq!(namespace["tools"].as_array().unwrap().len(), 1, "{key}");
+    }
 }

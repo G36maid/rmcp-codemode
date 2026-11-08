@@ -312,7 +312,7 @@ async fn native_host_tools_pipe_with_upstream_mcp_tools() {
     let result = client
         .call_tool(
             CallToolRequestParams::new("codemode").with_arguments(
-                json!({ "script": "return (await searchTools(\"shell\")).map((h) => h.name);" })
+                json!({ "script": "return (await searchTools(\"shell\")).items.map((h) => h.name);" })
                     .as_object()
                     .cloned()
                     .unwrap(),

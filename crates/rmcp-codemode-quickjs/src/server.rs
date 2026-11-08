@@ -272,7 +272,7 @@ pub struct CodemodeServer {
     timeout: Option<std::time::Duration>,
     memory_limit: usize,
     mode: CodemodeMode,
-    namespace_descriptions: Arc<BTreeMap<String, String>>,
+    namespace_infos: Arc<BTreeMap<String, rmcp_codemode::NamespaceInfo>>,
     store: Store,
     /// Bounded concurrency for script VMs, acquired FIFO (pi's worker
     /// pool: at most N workers alive, scripts queue in arrival order).
@@ -292,7 +292,7 @@ impl CodemodeServer {
             timeout: None,
             memory_limit: super::types::DEFAULT_MEMORY_LIMIT,
             mode: CodemodeMode::default(),
-            namespace_descriptions: Arc::default(),
+            namespace_infos: Arc::default(),
             store,
             worker_semaphore: Arc::new(tokio::sync::Semaphore::new(default_max_workers())),
             worker_wait: WORKER_WAIT,
@@ -308,17 +308,22 @@ impl CodemodeServer {
     pub fn from_aggregator(
         aggregator: std::sync::Arc<rmcp_codemode::aggregate::Aggregator>,
     ) -> Self {
-        let namespace_descriptions: BTreeMap<String, String> = aggregator
+        let namespace_infos: BTreeMap<String, rmcp_codemode::NamespaceInfo> = aggregator
             .namespaces()
             .filter_map(|namespace| {
-                aggregator
-                    .registry()
-                    .namespace_description(namespace)
-                    .map(|d| (namespace.to_owned(), d.to_owned()))
+                let info = aggregator.registry().namespace_info(namespace)?;
+                Some((
+                    namespace.to_owned(),
+                    rmcp_codemode::NamespaceInfo {
+                        description: info.description.clone(),
+                        instructions: info.instructions.clone(),
+                        aliases: info.aliases.clone(),
+                    },
+                ))
             })
             .collect();
         let mut server = Self::new(tools_from_aggregator(aggregator));
-        server.namespace_descriptions = Arc::new(namespace_descriptions);
+        server.namespace_infos = Arc::new(namespace_infos);
         server
     }
 
@@ -450,7 +455,11 @@ impl CodemodeServer {
         let mut sections = String::new();
         for (namespace, tools) in &by_namespace {
             let mut members = String::new();
-            if let Some(description) = self.namespace_descriptions.get(*namespace) {
+            if let Some(description) = self
+                .namespace_infos
+                .get(*namespace)
+                .and_then(|i| i.description.as_deref())
+            {
                 members.push_str(&format!("<!-- {description} -->\n"));
             }
             for tool in tools {
@@ -514,7 +523,7 @@ impl CodemodeServer {
         let timeout = self.timeout;
         let memory_limit = self.memory_limit;
         let store = Arc::clone(&self.store);
-        let namespace_descriptions = Arc::clone(&self.namespace_descriptions);
+        let namespace_infos = Arc::clone(&self.namespace_infos);
         let outcome = tokio::spawn(async move {
             let sandbox_tools: Vec<SandboxTool> = tools
                 .iter()
@@ -531,7 +540,7 @@ impl CodemodeServer {
                 })
                 .collect();
             let mut sandbox = Sandbox::with_memory_limit(memory_limit).await?;
-            sandbox.set_namespace_descriptions((*namespace_descriptions).clone());
+            sandbox.set_namespace_infos((*namespace_infos).clone());
             sandbox
                 .execute_with_store(&script, sandbox_tools, timeout, Some(&store))
                 .await

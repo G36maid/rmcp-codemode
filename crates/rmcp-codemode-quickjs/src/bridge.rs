@@ -47,7 +47,7 @@ pub(crate) fn setup_globals<'js>(
     exit_requested: Arc<AtomicBool>,
     pending_store: Arc<Mutex<BTreeMap<String, Value>>>,
     committed_store: Option<Store>,
-    namespace_descriptions: Arc<BTreeMap<String, String>>,
+    namespace_infos: Arc<BTreeMap<String, rmcp_codemode::NamespaceInfo>>,
 ) -> Result<(), SandboxError> {
     let globals = ctx.globals();
 
@@ -321,12 +321,12 @@ pub(crate) fn setup_globals<'js>(
     }
     {
         let tools = Arc::clone(&tools);
-        let namespace_descriptions = Arc::clone(&namespace_descriptions);
+        let namespace_infos = Arc::clone(&namespace_infos);
         globals
             .set(
                 "__describeNamespace",
                 Func::from(move |name: String| -> String {
-                    describe_namespace_response(&tools, &namespace_descriptions, &name)
+                    describe_namespace_response(&tools, &namespace_infos, &name)
                 }),
             )
             .map_err(rquickjs_error)?;
@@ -503,8 +503,9 @@ fn canonical_tool_path(name: &str, tools: &BTreeMap<String, SandboxTool>) -> Opt
         .find(|known| normalize_identifier(known) == name)
         .cloned()
 }
-/// The `searchTools(query, { limit?, namespace? })` response: `{ name,
-/// description }[]` ranked by BM25 (pi's default limit 8). An empty query
+/// The `searchTools(query, { limit?, namespace?, offset? })` response (pi's
+/// shape, with OpenCode's paging): `{ items, remaining, next }` — ranked by
+/// BM25 over names and descriptions (pi's default limit 8). An empty query
 /// returns tools in path order, so scripts can browse a namespace.
 fn search_tools_response(
     tools: &BTreeMap<String, SandboxTool>,
@@ -517,6 +518,11 @@ fn search_tools_response(
         .and_then(Value::as_u64)
         .map(|n| n as usize)
         .unwrap_or(8);
+    let offset = options
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let namespace = options.get("namespace").and_then(Value::as_str);
     let candidates: Vec<(&String, &SandboxTool)> = tools
         .iter()
@@ -525,7 +531,7 @@ fn search_tools_response(
         })
         .collect();
     if candidates.is_empty() {
-        return "[]".to_owned();
+        return json!({ "items": [], "remaining": 0, "next": null }).to_string();
     }
     let index = SearchIndex::build(candidates.iter().map(|(path, tool)| {
         (
@@ -534,12 +540,20 @@ fn search_tools_response(
             Vec::new(),
         )
     }));
-    let hits = index.search(query, limit);
-    let hits_json: Vec<Value> = hits
-        .iter()
+    // Rank everything, then page: `remaining` and `next` need the full count.
+    let ranked = index.search(query, candidates.len());
+    let paged = ranked.iter().skip(offset).take(limit);
+    let items: Vec<Value> = paged
         .map(|hit| json!({ "name": hit.name, "description": hit.description }))
         .collect();
-    serde_json::to_string(&hits_json).unwrap_or_else(|_| "[]".to_owned())
+    let remaining = ranked.len().saturating_sub(offset + items.len());
+    let next = if remaining > 0 {
+        json!(offset + items.len())
+    } else {
+        json!(null)
+    };
+    serde_json::to_string(&json!({ "items": items, "remaining": remaining, "next": next }))
+        .unwrap_or_else(|_| json!({ "items": [], "remaining": 0, "next": null }).to_string())
 }
 
 /// The `describeTool(name)` response: `{ name, description, declaration }` or
@@ -561,15 +575,21 @@ fn describe_tool_response(tools: &BTreeMap<String, SandboxTool>, name: &str) -> 
     serde_json::to_string(&response).unwrap_or_else(|_| "null".to_owned())
 }
 
-/// The `describeNamespace(name)` response: `{ name, description?, tools:
-/// [...] }` for a path prefix, or `null` when no tool lives under it. The
-/// namespace description comes from the host's registry when known.
+/// The `describeNamespace(name)` response: `{ name, description?,
+/// instructions?, tools: [...] }` (pi's shape), or `null` when the name
+/// resolves to no namespace. The name resolves through the namespace's own
+/// name and its aliases (pi: `describeNamespace("docs")` finds
+/// `mcp__docs`); members are the tools whose path starts with the
+/// canonical namespace plus a `.`.
 fn describe_namespace_response(
     tools: &BTreeMap<String, SandboxTool>,
-    namespace_descriptions: &BTreeMap<String, String>,
+    namespace_infos: &BTreeMap<String, rmcp_codemode::NamespaceInfo>,
     name: &str,
 ) -> String {
-    let prefix = format!("{name}.");
+    let Some(canonical) = resolve_namespace_name(namespace_infos, name) else {
+        return "null".to_owned();
+    };
+    let prefix = format!("{canonical}.");
     let members: Vec<&SandboxTool> = tools
         .iter()
         .filter(|(path, _)| path.starts_with(&prefix))
@@ -593,10 +613,44 @@ fn describe_namespace_response(
         })
         .collect();
     let mut response = serde_json::Map::new();
-    response.insert("name".to_owned(), json!(name));
-    if let Some(description) = namespace_descriptions.get(name) {
+    response.insert("name".to_owned(), json!(canonical));
+    let info = namespace_infos.get(&canonical);
+    if let Some(description) = info.and_then(|i| i.description.as_deref()) {
         response.insert("description".to_owned(), json!(description));
+    }
+    if let Some(instructions) = info.and_then(|i| i.instructions.as_deref()) {
+        response.insert("instructions".to_owned(), json!(instructions));
     }
     response.insert("tools".to_owned(), json!(tools_json));
     serde_json::to_string(&Value::Object(response)).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// Resolve a script-supplied namespace name to a canonical namespace: the
+/// name itself, then a namespace whose own name or an alias matches as the
+/// same script identifier (pi's `isNamespaceName`), then a path prefix of
+/// the tree (a `describeNamespace("api")` for `api.issues.list` still
+/// works even without declared metadata).
+fn resolve_namespace_name(
+    namespace_infos: &BTreeMap<String, rmcp_codemode::NamespaceInfo>,
+    name: &str,
+) -> Option<String> {
+    if namespace_infos.contains_key(name) {
+        return Some(name.to_owned());
+    }
+    let normalized = normalize_identifier(name);
+    let by_metadata = namespace_infos
+        .iter()
+        .find(|(canonical, info)| {
+            normalize_identifier(canonical) == normalized
+                || info
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize_identifier(alias) == normalized)
+        })
+        .map(|(canonical, _)| canonical.clone());
+    if by_metadata.is_some() {
+        return by_metadata;
+    }
+    // Fall back to a path-prefix namespace of the tree itself.
+    Some(name.to_owned())
 }

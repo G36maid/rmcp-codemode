@@ -113,9 +113,9 @@ fn extract_options(source: &str) -> (String, Result<ScriptOptions, String>) {
 pub struct Sandbox {
     /// Per-run VM heap limit in bytes.
     memory_limit: usize,
-    /// Namespace descriptions served to `describeNamespace`; set by the host
-    /// (an aggregator knows its upstreams' descriptions).
-    namespace_descriptions: Arc<BTreeMap<String, String>>,
+    /// Namespace metadata served to `describeNamespace` (descriptions,
+    /// instructions, aliases) — set by the host, which knows the upstreams.
+    namespace_infos: Arc<BTreeMap<String, rmcp_codemode::NamespaceInfo>>,
 }
 
 impl Sandbox {
@@ -129,14 +129,33 @@ impl Sandbox {
     pub async fn with_memory_limit(limit: usize) -> Result<Self, SandboxError> {
         Ok(Self {
             memory_limit: limit,
-            namespace_descriptions: Arc::default(),
+            namespace_infos: Arc::default(),
         })
     }
 
-    /// Set the namespace descriptions served to `describeNamespace` (pi's
-    /// namespace-level `description` field).
+    /// Set the namespace metadata served to `describeNamespace` (pi's
+    /// `ToolNamespace`: descriptions, instructions, aliases).
+    pub fn set_namespace_infos(&mut self, infos: BTreeMap<String, rmcp_codemode::NamespaceInfo>) {
+        self.namespace_infos = Arc::new(infos);
+    }
+
+    /// Set the namespace descriptions served to `describeNamespace` (the
+    /// description-only form of [`Sandbox::set_namespace_infos`]).
     pub fn set_namespace_descriptions(&mut self, descriptions: BTreeMap<String, String>) {
-        self.namespace_descriptions = Arc::new(descriptions);
+        self.namespace_infos = Arc::new(
+            descriptions
+                .into_iter()
+                .map(|(namespace, description)| {
+                    (
+                        namespace,
+                        rmcp_codemode::NamespaceInfo {
+                            description: Some(description),
+                            ..rmcp_codemode::NamespaceInfo::default()
+                        },
+                    )
+                })
+                .collect(),
+        );
     }
 
     /// Execute a script.
@@ -242,7 +261,7 @@ impl Sandbox {
         let exit_flag = Arc::clone(&exit_requested);
         let pending_store_arc = Arc::clone(&pending_store);
         let store_arc = store.cloned();
-        let namespace_descriptions_arc = Arc::clone(&self.namespace_descriptions);
+        let namespace_infos_arc = Arc::clone(&self.namespace_infos);
         // The deadline covers the whole execution — the script's own awaits
         // and upstream tool calls included (the interrupt handler handles
         // pure-JS loops; this backstop covers hung upstream calls).
@@ -260,7 +279,7 @@ impl Sandbox {
                         deadline_instant,
                         pending_store_arc,
                         store_arc,
-                        namespace_descriptions_arc,
+                        namespace_infos_arc,
                     )
                     .await
                 })
@@ -318,7 +337,7 @@ async fn run_script<'js>(
     deadline_instant: Option<Instant>,
     pending_store: Arc<Mutex<BTreeMap<String, Value>>>,
     committed_store: Option<Store>,
-    namespace_descriptions: Arc<BTreeMap<String, String>>,
+    namespace_infos: Arc<BTreeMap<String, rmcp_codemode::NamespaceInfo>>,
 ) -> Result<Value, SandboxError> {
     setup_globals(
         &ctx,
@@ -329,7 +348,7 @@ async fn run_script<'js>(
         Arc::clone(&exit_requested),
         pending_store,
         committed_store,
-        namespace_descriptions,
+        namespace_infos,
     )?;
     // The script is the body of an async function. The IIFE's result crosses
     // as a JSON envelope string so neither side needs native value conversion.

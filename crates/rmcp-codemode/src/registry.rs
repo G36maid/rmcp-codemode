@@ -26,6 +26,22 @@ pub struct RegistryEntry {
     pub exposure: ToolExposure,
 }
 
+/// Metadata for a namespace: a group of related tools, such as the tools of
+/// one MCP server (pi's `ToolNamespace`). Descriptions and instructions are
+/// model-facing; aliases let scripts look the namespace up by a friendlier
+/// name (pi: `describeNamespace("docs")` finds `mcp__docs`).
+#[derive(Clone, Debug, Default)]
+#[allow(clippy::exhaustive_structs)] // plain data record
+pub struct NamespaceInfo {
+    /// Shown once with the group in discovery results.
+    pub description: Option<String>,
+    /// Longer usage guidance, such as MCP server instructions. Returned by
+    /// `describeNamespace` but not part of tool listings.
+    pub instructions: Option<String>,
+    /// Other names that resolve to this namespace in discovery lookups.
+    pub aliases: Vec<String>,
+}
+
 /// An aggregated, namespaced tool registry.
 ///
 /// Keys are full tool paths; iteration is in sorted path order, so `tools/list`
@@ -33,8 +49,9 @@ pub struct RegistryEntry {
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     entries: std::collections::BTreeMap<String, RegistryEntry>,
-    /// Description shown for a namespace in discovery results.
-    namespace_descriptions: std::collections::BTreeMap<String, String>,
+    /// Model-facing metadata per namespace (description, instructions,
+    /// aliases) — pi's `ToolNamespace`.
+    namespaces: std::collections::BTreeMap<String, NamespaceInfo>,
 }
 
 /// Error returned when a registry insertion collides.
@@ -91,15 +108,71 @@ impl Registry {
 
     /// Set a human-readable description for a namespace, shown in discovery.
     pub fn set_namespace_description(&mut self, namespace: &str, description: impl Into<String>) {
-        self.namespace_descriptions
-            .insert(namespace.to_owned(), description.into());
+        self.namespaces
+            .entry(namespace.to_owned())
+            .or_default()
+            .description = Some(description.into());
     }
 
     /// A namespace's description, if one was set.
     pub fn namespace_description(&self, namespace: &str) -> Option<&str> {
-        self.namespace_descriptions
+        self.namespaces
             .get(namespace)
-            .map(String::as_str)
+            .and_then(|info| info.description.as_deref())
+    }
+
+    /// Set a namespace's longer usage guidance (pi's `instructions`, such as
+    /// the MCP server's own instructions). Returned by `describeNamespace`
+    /// but not part of tool listings.
+    pub fn set_namespace_instructions(&mut self, namespace: &str, instructions: impl Into<String>) {
+        self.namespaces
+            .entry(namespace.to_owned())
+            .or_default()
+            .instructions = Some(instructions.into());
+    }
+
+    /// A namespace's usage guidance, if one was set.
+    pub fn namespace_instructions(&self, namespace: &str) -> Option<&str> {
+        self.namespaces
+            .get(namespace)
+            .and_then(|info| info.instructions.as_deref())
+    }
+
+    /// Add other names that resolve to this namespace in discovery lookups
+    /// (pi: `describeNamespace("docs")` finds `mcp__docs`). The namespace's
+    /// own name always matches too.
+    pub fn add_namespace_aliases(&mut self, namespace: &str, aliases: &[String]) {
+        self.namespaces
+            .entry(namespace.to_owned())
+            .or_default()
+            .aliases
+            .extend(aliases.iter().cloned());
+    }
+
+    /// Resolve a script-supplied namespace name to a canonical namespace:
+    /// the name itself, then any namespace whose own name or one of its
+    /// aliases matches (pi's `isNamespaceName`: written as-is, or as the
+    /// same script identifier, so `dev-radius` and `dev_radius` both hit).
+    pub fn resolve_namespace(&self, name: &str) -> Option<String> {
+        if self.namespaces.contains_key(name) {
+            return Some(name.to_owned());
+        }
+        let normalized = crate::identity::normalize_identifier(name);
+        self.namespaces
+            .iter()
+            .find(|(canonical, info)| {
+                crate::identity::normalize_identifier(canonical) == normalized
+                    || info
+                        .aliases
+                        .iter()
+                        .any(|alias| crate::identity::normalize_identifier(alias) == normalized)
+            })
+            .map(|(canonical, _)| canonical.clone())
+    }
+
+    /// A namespace's metadata, if any was set.
+    pub fn namespace_info(&self, namespace: &str) -> Option<&NamespaceInfo> {
+        self.namespaces.get(namespace)
     }
 
     /// All entries, in sorted path order.
@@ -153,8 +226,13 @@ impl Registry {
     pub fn search_index(&self) -> SearchIndex {
         let extra = |entry: &RegistryEntry| -> Vec<String> {
             let mut texts: Vec<String> = Vec::new();
-            if let Some(desc) = self.namespace_description(&entry.namespace) {
-                texts.push(desc.to_owned());
+            if let Some(info) = self.namespaces.get(&entry.namespace) {
+                if let Some(desc) = &info.description {
+                    texts.push(desc.clone());
+                }
+                if let Some(instructions) = &info.instructions {
+                    texts.push(instructions.clone());
+                }
             }
             if let Some(props) = entry
                 .tool

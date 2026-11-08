@@ -301,13 +301,20 @@ impl AggregatorBuilder {
                                     source: Box::new(source),
                                 }
                             })?;
-                        Ok::<_, AggregateError>((namespace, handle, tools))
+                        // The upstream's own usage guidance (pi: the MCP
+                        // connection's `instructions`, which the server
+                        // declares in its handshake).
+                        let instructions = handle
+                            .peer
+                            .peer_info()
+                            .and_then(|info| info.instructions.clone());
+                        Ok::<_, AggregateError>((namespace, handle, tools, instructions))
                     }
                 });
         let results = join_all(connections).await;
 
         for result in results {
-            let (namespace, handle, tools) = result?;
+            let (namespace, handle, tools, instructions) = result?;
             if let Some((_, exposure, desc, naming, _)) = self
                 .configs
                 .iter()
@@ -315,6 +322,9 @@ impl AggregatorBuilder {
             {
                 if let Some(desc) = desc {
                     registry.set_namespace_description(&namespace, desc.clone());
+                }
+                if let Some(instructions) = instructions {
+                    registry.set_namespace_instructions(&namespace, instructions);
                 }
                 for tool in tools {
                     registry.insert_with_naming(&namespace, naming, tool, *exposure)?;
