@@ -437,3 +437,89 @@ async fn tool_call_limit_stops_the_script_with_partial_output() {
         "{text}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn store_domains_are_independent_and_selected_via_meta() {
+    use rmcp::model::CallToolRequestParams as Params;
+
+    // Two domains, two files, independent values (pi: one store per
+    // session branch; SEP-1319 _meta selects the domain).
+    let dir = std::env::temp_dir().join(format!("codedomains-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let space = Space::new();
+    let server = CodemodeServer::new(
+        SuspendingQuickJsEngine::from_engine(QuickJsEngine::default()),
+        space,
+    )
+    .with_store_persistence(Arc::new(
+        rmcp_codemode_quickjs::server::FileStorePersister::new(dir.join("store.json")),
+    ));
+    let (client, _task) = host_client(server).await;
+
+    // Write into domain "main" via _meta...
+    let main_call = || {
+        let client = client.clone();
+        async move {
+            let mut params = Params::new("codemode").with_arguments(
+                json!({ "script": r#"store("k", "from-main"); return load("k");"# })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            );
+            params.meta =
+                Some(serde_json::from_value(json!({ "codemode/storeDomain": "main" })).unwrap());
+            client.call_tool(params).await.expect("main call")
+        }
+    };
+    let result = main_call().await;
+    assert!(
+        result_text(&result).contains("from-main"),
+        "{}",
+        result_text(&result)
+    );
+
+    // ...then write a different value into the default domain.
+    let default_result = client
+        .call_tool(script_args(
+            r#"store("k", "from-default"); return load("k");"#,
+        ))
+        .await
+        .expect("default call");
+    assert!(
+        result_text(&default_result).contains("from-default"),
+        "{}",
+        result_text(&default_result)
+    );
+
+    // Reading back from "main" sees main's value, not default's.
+    let read_main = {
+        let client = client.clone();
+        async move {
+            let mut params = Params::new("codemode").with_arguments(
+                json!({ "script": "return load(\"k\");" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            );
+            params.meta =
+                Some(serde_json::from_value(json!({ "codemode/storeDomain": "main" })).unwrap());
+            client.call_tool(params).await.expect("read main")
+        }
+    };
+    assert!(
+        result_text(&read_main.await).contains("from-main"),
+        "main keeps its own value"
+    );
+
+    // Persistence: one file per domain.
+    assert!(dir.join("store.main.json").exists(), "domain file exists");
+    assert!(
+        dir.join("store.default.json").exists(),
+        "default file exists"
+    );
+    let main: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("store.main.json")).unwrap())
+            .unwrap();
+    assert_eq!(main["k"], "from-main");
+    let _ = std::fs::remove_dir_all(&dir);
+}

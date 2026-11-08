@@ -72,6 +72,11 @@ pub struct RunContext {
     /// The committed script store (`load` reads it; `store` writes commit
     /// here on success). Empty unless the host persists state.
     pub store: BTreeMap<String, Value>,
+    /// Which store domain this run reads and writes (pi: one store per
+    /// session branch — `codemode-store` entries applied along the branch).
+    /// The host keys its persisted stores by domain; `None` is the default
+    /// single-domain behavior.
+    pub store_domain: Option<String>,
     /// Deterministic-run parameters. `None` (the default) means the
     /// script sees the host's real clocks.
     pub deterministic: Option<Determinism>,
@@ -84,6 +89,7 @@ impl RunContext {
             space,
             budget: Budget::default(),
             store: BTreeMap::new(),
+            store_domain: None,
             deterministic: None,
         }
     }
@@ -97,6 +103,13 @@ impl RunContext {
     /// Set the committed store (`load`'s initial view).
     pub fn with_store(mut self, store: BTreeMap<String, Value>) -> Self {
         self.store = store;
+        self
+    }
+
+    /// Run in the named store domain (`load`/`store` see that domain's
+    /// values; pi's per-branch stores).
+    pub fn with_store_domain(mut self, domain: impl Into<String>) -> Self {
+        self.store_domain = Some(domain.into());
         self
     }
 

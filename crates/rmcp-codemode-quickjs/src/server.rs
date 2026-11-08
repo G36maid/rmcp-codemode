@@ -29,18 +29,22 @@ use serde_json::json;
 /// The single tool name exposed to hosts.
 pub const CODEMODE_TOOL_NAME: &str = "codemode";
 
-/// The script store: small JSON values kept across codemode calls; writes
-/// commit only when the script succeeds (pi's semantics).
-pub type Store = Arc<Mutex<BTreeMap<String, Value>>>;
+/// The script stores, keyed by domain (pi: one store per session branch;
+/// the default domain is `"default"`). Small JSON values kept across
+/// codemode calls; writes commit only when the script succeeds.
+pub type Store = Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>;
+
+/// The store domain a run without an explicit one uses.
+pub const DEFAULT_STORE_DOMAIN: &str = "default";
 
 /// How the store persists across process restarts. A host with sessions
 /// plugs in its own implementation (pi keeps the store in the session
 /// file); [`FileStorePersister`] is the simple JSON-file default.
 pub trait StorePersister: Send + Sync {
-    /// Persist the full store after a script commits writes.
-    fn save(&self, store: &BTreeMap<String, Value>);
-    /// Load the store at server construction.
-    fn load(&self) -> BTreeMap<String, Value>;
+    /// Persist one domain's store after a script commits writes.
+    fn save(&self, domain: &str, store: &BTreeMap<String, Value>);
+    /// Load one domain's store.
+    fn load(&self, domain: &str) -> BTreeMap<String, Value>;
 }
 
 /// A [`StorePersister`] backed by one JSON file, written atomically
@@ -57,23 +61,49 @@ impl FileStorePersister {
 }
 
 impl StorePersister for FileStorePersister {
-    fn save(&self, store: &BTreeMap<String, Value>) {
-        let tmp = self.path.with_extension("json.tmp");
+    fn save(&self, domain: &str, store: &BTreeMap<String, Value>) {
+        // One file per domain: <path>.<domain>.json, so domains don't
+        // clobber each other.
+        let path = self.domain_path(domain);
+        let tmp = path.with_extension("json.tmp");
         if serde_json::to_string_pretty(store)
             .map_err(|_| ())
             .and_then(|text| std::fs::write(&tmp, text).map_err(|_| ()))
-            .and_then(|()| std::fs::rename(&tmp, &self.path).map_err(|_| ()))
+            .and_then(|()| std::fs::rename(&tmp, &path).map_err(|_| ()))
             .is_err()
         {
             let _ = std::fs::remove_file(&tmp);
         }
     }
 
-    fn load(&self) -> BTreeMap<String, Value> {
-        std::fs::read_to_string(&self.path)
+    fn load(&self, domain: &str) -> BTreeMap<String, Value> {
+        std::fs::read_to_string(self.domain_path(domain))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
+    }
+}
+
+impl FileStorePersister {
+    /// The file backing one domain: the base path with `.json` replaced
+    /// by `.<domain>.json`, the domain sanitized for filesystems (only
+    /// [a-zA-Z0-9_-] kept).
+    fn domain_path(&self, domain: &str) -> std::path::PathBuf {
+        let sanitized: String = domain
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = self.path.file_stem().map_or_else(
+            || "codemode-store".to_owned(),
+            |stem| stem.to_string_lossy().to_string(),
+        );
+        self.path.with_file_name(format!("{stem}.{sanitized}.json"))
     }
 }
 
@@ -150,8 +180,10 @@ pub struct CodemodeServer<E> {
     store: Store,
     persister: Option<Arc<dyn StorePersister>>,
     /// Suspended runs awaiting approval, by id (CF's pending map). A host
-    /// calls [`CodemodeServer::resume`] with the id after approval.
-    suspended: Arc<Mutex<BTreeMap<String, SuspendState>>>,
+    /// calls [`CodemodeServer::resume`] with the id after approval. Each
+    /// entry carries the run's store domain, so the resumed run commits
+    /// into the same store it started with.
+    suspended: Arc<Mutex<BTreeMap<String, (SuspendState, String)>>>,
     next_suspension: Arc<std::sync::atomic::AtomicU64>,
     /// Admission control (pi's worker pool): at most `max_workers` scripts
     /// run concurrently; the rest queue in arrival order and fail without
@@ -246,7 +278,11 @@ where
 
     /// Persist the script store through `persister`.
     pub fn with_store_persistence(mut self, persister: Arc<dyn StorePersister>) -> Self {
-        *self.store.lock().unwrap() = persister.load();
+        let default = persister.load(DEFAULT_STORE_DOMAIN);
+        self.store
+            .lock()
+            .unwrap()
+            .insert(DEFAULT_STORE_DOMAIN.to_owned(), default);
         self.persister = Some(persister);
         self
     }
@@ -261,35 +297,53 @@ where
         Catalog::new(&self.space, &self.budget)
     }
 
-    fn run_context(&self) -> RunContext {
+    /// A run context reading and writing `domain`'s store.
+    fn run_context_for(&self, domain: &str) -> RunContext {
+        let store = self
+            .store
+            .lock()
+            .unwrap()
+            .get(domain)
+            .cloned()
+            .unwrap_or_default();
         RunContext::new((*self.space).clone())
             .with_budget(self.budget.clone())
-            .with_store(self.store.lock().unwrap().clone())
+            .with_store(store)
+            .with_store_domain(domain)
+    }
+
+    fn run_context(&self) -> RunContext {
+        self.run_context_for(DEFAULT_STORE_DOMAIN)
     }
 
     /// Resume a suspended run by id (CF's `runtime.approve` flow): the
     /// recorded calls replay, calls past the recording yield again.
     pub async fn resume(&self, id: &str) -> Result<CallToolResult, McpError> {
-        let state = self.suspended.lock().unwrap().remove(id).ok_or_else(|| {
+        let (state, domain) = self.suspended.lock().unwrap().remove(id).ok_or_else(|| {
             McpError::invalid_params(format!("unknown suspended run '{id}'"), None)
         })?;
         // Approval means "allow what follows": the resumed run executes
-        // without pausing (the host already decided).
+        // without pausing (the host already decided), in its store domain.
         let result = self
             .engine
-            .execute(&state.code, &self.run_context())
+            .execute(&state.code, &self.run_context_for(&domain))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.persist_store(&result);
+        self.persist_store(&result, &domain);
         Ok(self.result_to_call_result(&result))
     }
 
-    fn persist_store(&self, result: &rmcp_codemode::ScriptResult) {
-        if !result.ok || result.store_writes.set.is_empty() {
+    /// Commit a run's store writes into its domain (defaulting to
+    /// [`DEFAULT_STORE_DOMAIN`]) and persist that domain.
+    fn persist_store(&self, result: &rmcp_codemode::ScriptResult, domain: &str) {
+        if !result.ok
+            || (result.store_writes.set.is_empty() && result.store_writes.delete.is_empty())
+        {
             return;
         }
         {
-            let mut store = self.store.lock().unwrap();
+            let mut stores = self.store.lock().unwrap();
+            let store = stores.entry(domain.to_owned()).or_default();
             for (key, value) in &result.store_writes.set {
                 store.insert(key.clone(), value.clone());
             }
@@ -298,7 +352,14 @@ where
             }
         }
         if let Some(persister) = &self.persister {
-            persister.save(&self.store.lock().unwrap());
+            let store = self
+                .store
+                .lock()
+                .unwrap()
+                .get(domain)
+                .cloned()
+                .unwrap_or_default();
+            persister.save(domain, &store);
         }
     }
 
@@ -321,6 +382,16 @@ where
     /// Run one script one-shot (public for hosts that want the result
     /// directly, e.g. the store test).
     pub async fn run_one_shot(&self, script: &str) -> Result<CallToolResult, McpError> {
+        self.run_one_shot_in(script, DEFAULT_STORE_DOMAIN).await
+    }
+
+    /// Run one script one-shot inside `domain`'s store (`_meta`-selected;
+    /// pi's per-branch stores).
+    pub async fn run_one_shot_in(
+        &self,
+        script: &str,
+        domain: &str,
+    ) -> Result<CallToolResult, McpError> {
         // pi: the wait for a worker counts toward the script's deadline,
         // and a script that never gets one fails without starting.
         let Some(_permit) = self.workers.reserve(self.budget.timeout_ms).await else {
@@ -338,10 +409,10 @@ where
         };
         let result = self
             .engine
-            .execute(script, &self.run_context())
+            .execute(script, &self.run_context_for(domain))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.persist_store(&result);
+        self.persist_store(&result, domain);
         Ok(self.result_to_call_result(&result))
     }
 
@@ -349,6 +420,17 @@ where
     /// `requires_approval` (CF's annotations). The run's state is stored
     /// under a returned id; [`CodemodeServer::resume`] continues it.
     pub async fn run_with_approval(&self, script: &str) -> Result<CallToolResult, McpError> {
+        self.run_with_approval_in(script, DEFAULT_STORE_DOMAIN)
+            .await
+    }
+
+    /// [`run_with_approval`](Self::run_with_approval) inside `domain`'s
+    /// store.
+    pub async fn run_with_approval_in(
+        &self,
+        script: &str,
+        domain: &str,
+    ) -> Result<CallToolResult, McpError> {
         let Some(_permit) = self.workers.reserve(self.budget.timeout_ms).await else {
             return Ok(self.result_to_call_result(&ScriptResult::failed(
                 format!(
@@ -372,7 +454,7 @@ where
             let Some(call) = handle.next_call.next().await else {
                 // The run ended; deliver its result.
                 let result = handle.result.await.unwrap_or_default();
-                self.persist_store(&result);
+                self.persist_store(&result, domain);
                 return Ok(self.result_to_call_result(&result));
             };
             let tool = self.space.entry(&call.name);
@@ -386,7 +468,10 @@ where
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 );
                 let state = SuspendState::new(script, answered);
-                self.suspended.lock().unwrap().insert(id.clone(), state);
+                self.suspended
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), (state, domain.to_owned()));
                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                     json!({
                         "status": "paused",
@@ -483,7 +568,7 @@ where
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         if request.name != CODEMODE_TOOL_NAME {
             // Route native direct tools (a host calls them natively).
@@ -518,10 +603,21 @@ where
             })?
             .to_owned();
 
+        // SEP-1319 `_meta` (rmcp 3.9 moves the wire metadata into the
+        // request context): hosts scope the store by passing
+        // `codemode/storeDomain` (pi's per-branch stores); unknown keys
+        // are ignored, as the spec requires.
+        let domain = context
+            .meta
+            .get("codemode/storeDomain")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_STORE_DOMAIN)
+            .to_owned();
+
         // Runs annotated with approval-required tools pause; everything
         // else executes one-shot. Approval pauses are opt-in via
         // `run_with_approval`; a plain `call_tool` runs one-shot.
-        self.run_one_shot(&script)
+        self.run_one_shot_in(&script, &domain)
             .await
             .map(CallToolResponse::Complete)
     }
