@@ -174,6 +174,10 @@ while let Some(call) = handle.next_call.next().await {
 
 The host answers every yielded call — allow, deny, or pause. Resuming replays the recorded outcomes (the recorded calls never re-execute) and continues the script; the state is `serde`-serializable, so persistence is the host's one-liner. `CodemodeServer::run_with_approval` wraps the whole flow: pause at the annotated tool, return `{ status: "paused", executionId, pending }`, and `resume(&execution_id)` continues after approval.
 
+### Deterministic replay
+
+Set [`Determinism`] on the run context and the run becomes replayable (pi's model): the VM's clock starts at `started_at_ms` and advances **only** with delivered results — the host passes a clock value with each answer — and never goes backwards. `Math.random` draws from a PRNG over the seed; `WeakRef`/`FinalizationRegistry` don't exist in a deterministic VM. The recording captures each applied clock value, so a resumed run observes the same times as the original: same script + same seed + same clock values + same results → same output. [`SuspendState`] carries the determinism config, so a resumed run is self-contained.
+
 ## Development
 
 The workspace mirrors the [rust-sdk](https://github.com/modelcontextprotocol/rust-sdk) layout and policies: resolver 3, edition 2024, workspace lints, nightly rustfmt, `just` recipes, and a [`DEPENDENCY_POLICY.md`](DEPENDENCY_POLICY.md).
@@ -198,7 +202,7 @@ Known gaps:
 
 - Namespace-scoped store domains (pi scopes stores per session/branch).
 - The snippet save/run API (`codemode.run("name")` — the store persists; the script-reuse surface is next).
-- Deterministic replay hardening (pi's virtual clock + seeded PRNG + fingerprint) — replay currently requires call results to be replayable, which holds for the recorded-outcome model but not for scripts that read wall-clock time.
+- Timezone is the host process's (pi runs the deterministic VM in UTC); scripts that format dates with local offsets replay process-dependently.
 - `_meta` plumbing; upstream reconnection (currently rebuild-only).
 
 ## License
