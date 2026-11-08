@@ -176,7 +176,7 @@ The host answers every yielded call — allow, deny, or pause. Resuming replays 
 
 ### Deterministic replay
 
-Set [`Determinism`] on the run context and the run becomes replayable (pi's model): the VM's clock starts at `started_at_ms` and advances **only** with delivered results — the host passes a clock value with each answer — and never goes backwards. `Math.random` draws from a PRNG over the seed; `WeakRef`/`FinalizationRegistry` don't exist in a deterministic VM. The recording captures each applied clock value, so a resumed run observes the same times as the original: same script + same seed + same clock values + same results → same output. [`SuspendState`] carries the determinism config, so a resumed run is self-contained.
+Set `Determinism` on the run context and the run becomes replayable (pi's model): the VM's clock starts at `started_at_ms` and advances **only** with delivered results — the host passes a clock value with each answer — and never goes backwards. `Math.random` draws from a PRNG over the seed; `WeakRef`/`FinalizationRegistry` don't exist in a deterministic VM. The recording captures each applied clock value, so a resumed run observes the same times as the original: same script + same seed + same clock values + same results → same output. `SuspendState` carries the determinism config, so a resumed run is self-contained.
 
 ## Development
 
