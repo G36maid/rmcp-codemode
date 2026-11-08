@@ -568,3 +568,95 @@ async fn resumed_run_replays_recorded_clock_values() {
     assert!(second.ok, "{:?}", second.error);
     assert_eq!(first.value, second.value, "replay observes the same clocks");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn opencode_search_semantics() {
+    // OC: search is a counted tool call (burns maxToolCalls, is observed),
+    // ranks exact path matches first, and ubiquitous query terms don't
+    // zero out the ranking.
+    let engine = QuickJsEngine::default();
+    let mut space = Space::new();
+    for i in 0..12 {
+        space
+            .insert(echo_tool(&format!("cat.tool{i:02}"), json!(i)))
+            .unwrap();
+    }
+    space
+        .insert(echo_tool("cat.my-tool", json!("hyphen")))
+        .unwrap();
+    let ctx =
+        RunContext::new(space).with_budget(rmcp_codemode::Budget::default().with_max_tool_calls(1));
+
+    // Ubiquitous term ("tool" is in every path) still ranks everything.
+    let r = engine
+        .execute(
+            r#"return (await searchTools("tool01")).items[0].name"#,
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.value, Some(json!("cat.tool01")));
+
+    // Exact-path query ranks the exact tool first, page shape intact.
+    let r = engine
+        .execute(
+            r#"return (await searchTools("my-tool")).items[0].name"#,
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.value, Some(json!("cat.my-tool")));
+
+    // Search burns the call budget and appears in the observed calls.
+    let r = engine
+        .execute(
+            r#"
+                searchTools("x");
+                try { await tools.cat.tool00({}); return "not counted"; }
+                catch (e) { return e.message; }
+            "#,
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        r.value
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("tool-call limit of 1")
+    );
+    assert_eq!(
+        r.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["searchTools"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opencode_console_formatting_is_total() {
+    // OC: cycles and opaque references render as markers instead of
+    // throwing; NaN/Infinity print literally (JSON.stringify emits null).
+    let engine = QuickJsEngine::default();
+    let ctx = RunContext::new(Space::new());
+    let r = engine
+        .execute(
+            r#"
+                const cycle = {}; cycle.self = cycle;
+                console.log(NaN, Infinity, -Infinity, cycle);
+                return "logged";
+            "#,
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(r.ok, "{:?}", r.error);
+    let text = r
+        .output
+        .iter()
+        .find_map(|item| match item {
+            rmcp_codemode::OutputItem::Console { text } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("console item");
+    assert_eq!(text, "NaN Infinity -Infinity {self: [Circular]}");
+}

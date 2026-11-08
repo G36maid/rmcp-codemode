@@ -158,7 +158,11 @@ impl SearchIndex {
                         let Some(df) = self.df.get(term) else {
                             continue;
                         };
-                        let idf = ((n - *df as f32 + 0.5) / (*df as f32 + 0.5)).max(1e-6).ln();
+                        // Lucene's non-negative idf: ubiquitous terms
+                        // (df == n) score ~0 instead of poisoning the
+                        // sum negative (a query of only such terms would
+                        // otherwise filter to zero hits).
+                        let idf = (1.0 + (n - *df as f32 + 0.5) / (*df as f32 + 0.5)).ln();
                         let field_len = doc.length as f32;
                         score += weight * idf * (*tf as f32 * (K1 + 1.0))
                             / (*tf as f32 + K1 * (1.0 - B + B * field_len / self.avg_len));

@@ -197,10 +197,32 @@ pub(crate) fn setup(
     {
         let space = space.clone();
         let namespaces = namespaces.clone();
+        let calls = Arc::clone(calls);
+        let counter = Arc::clone(call_counter);
+        let exit_requested = Arc::clone(exit_requested);
+        let budget = budget.clone();
         globals.set(
             "__searchTools",
             Func::from(move |query: String, opts_json: String| -> String {
-                search_tools_response(&space, &namespaces, &query, &opts_json)
+                // OC: search is a counted tool call — it burns
+                // maxToolCalls and appears in the observed calls.
+                if exit_requested.load(Ordering::Relaxed) {
+                    return json!({ "ok": false, "error": "script has exited" }).to_string();
+                }
+                if let Some(max) = budget.max_tool_calls
+                    && counter.load(Ordering::Relaxed) as usize >= max
+                {
+                    return json!({ "ok": false, "error": format!("Execution exceeded its tool-call limit of {max}.") }).to_string();
+                }
+                counter.fetch_add(1, Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                let response = search_tools_response(&space, &namespaces, &query, &opts_json);
+                calls.lock().unwrap().push(rmcp_codemode::CallRecord::finished(
+                    "searchTools",
+                    rmcp_codemode::CallStatus::Ok,
+                    started.elapsed().as_millis() as u64,
+                ));
+                response
             }),
         )?;
     }
@@ -643,9 +665,37 @@ globalThis.text = (value) => {{
     const err = globalThis.__emitText(typeof value === "string" ? value : JSON.stringify(value));
     if (err) throw new Error(err);
 }};
+// OC's rule: console formatting is total — cycles and opaque references
+// render as markers instead of throwing, NaN/Infinity print literally
+// (JSON.stringify would emit null).
+globalThis.__format = (value, seen) => {{
+    if (typeof value === "string") return value;
+    if (typeof value === "number") {{
+        if (Number.isNaN(value)) return "NaN";
+        if (value === Infinity) return "Infinity";
+        if (value === -Infinity) return "-Infinity";
+        return String(value);
+    }}
+    if (value === undefined) return "undefined";
+    if (typeof value === "function") return value.name ? `[Function: ${{value.name}}]` : "[Function]";
+    if (typeof value === "bigint" || typeof value === "symbol") return String(value);
+    if (value === null) return "null";
+    if (typeof value !== "object") return String(value);
+    if (value instanceof Error) return `${{value.name}}: ${{value.message}}`;
+    const box = seen ?? new WeakSet();
+    if (box.has(value)) return "[Circular]";
+    box.add(value);
+    if (Array.isArray(value)) return `[${{value.map((item) => globalThis.__format(item, box)).join(", ")}}]`;
+    const __fmtEntries = (entries, box) => entries.map(([k, v]) => `${{k}}: ${{globalThis.__format(v, box)}}`).join(", ");
+    if (value instanceof Map) return `Map(${{value.size}}) ${{__fmtEntries([...value.entries()], box)}}`;
+    if (value instanceof Set) return `Set(${{value.size}}) ${{[...value.values()].map((item) => globalThis.__format(item, box)).join(", ")}}`;
+    return `{{${{__fmtEntries(Object.entries(value), box)}}}}`;
+    const entries = Object.entries(value).map(([k, v]) => `${{k}}: ${{globalThis.__format(v, box)}}`);
+    return `{{${{entries.join(", ")}}}}`;
+}};
 globalThis.console = {{
     log: (...parts) => {{
-        const err = globalThis.__emitConsole(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
+        const err = globalThis.__emitConsole(parts.map((p) => globalThis.__format(p)).join(" "));
         if (err) throw new Error(err);
     }},
 }};
