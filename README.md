@@ -126,7 +126,7 @@ The script is the body of an async function: top-level `await` and `return` work
 | `searchTools(query, { limit?, namespace?, offset? })` | BM25-ranked discovery, paged: `{ items, remaining, next }` (default limit 8). |
 | `describeTool(name)` | Description plus TypeScript declaration, rendered from the JSON Schemas. |
 | `describeNamespace(name)` | `{ name, description?, instructions?, tools }` — resolves through aliases (`describeNamespace("docs")` finds `mcp__docs`). |
-| `store(key, value)` / `load(key)` | Small JSON values kept across codemode calls; writes commit only when the script succeeds. Back it with a persister for restart survival. |
+| `store(key, value)` / `load(key)` | Small JSON values kept across codemode calls; writes commit only when the script succeeds. Back it with a persister for restart survival. Hosts scope stores per session/branch by passing `_meta["codemode/storeDomain"]` with the call (pi's per-branch stores; one file per domain under `FileStorePersister`). |
 | `exit()` | End the script successfully — even when a try/catch swallows it. |
 | `return value` | A top-level `return` adds the value like `text()`. |
 | `// @options: {...}` | Optional first line: `{"max_output_tokens": ..., "timeout_ms": ...}`. |
@@ -200,10 +200,9 @@ PoC, tracking [rust-sdk#1437](https://github.com/modelcontextprotocol/rust-sdk/i
 
 Known gaps:
 
-- Namespace-scoped store domains (pi scopes stores per session/branch).
 - The snippet save/run API (`codemode.run("name")` — the store persists; the script-reuse surface is next).
 - Timezone is the host process's (pi runs the deterministic VM in UTC); scripts that format dates with local offsets replay process-dependently.
-- `_meta` plumbing; upstream reconnection (currently rebuild-only).
+- Upstream reconnection (currently rebuild-only).
 
 ## License
 
