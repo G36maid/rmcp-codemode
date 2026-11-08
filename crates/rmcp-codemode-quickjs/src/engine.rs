@@ -3,7 +3,8 @@
 //! [`QuickJsEngine`] runs one-shot scripts ([`Engine`]);
 //! [`SuspendingQuickJsEngine`] adds the host-controlled mode
 //! ([`SuspendingEngine`]): every tool call is yielded to the host through a
-//! channel, the host answers with [`Outcome`]s, and the run can pause —
+//! channel, the host answers with outcomes (`Outcome` in the core
+//! crate), and the run can pause —
 //! recording answered calls in a serializable [`SuspendState`] that a later
 //! run replays (pi's `start()`/`deliver()` with CF's durable-log states).
 
@@ -12,11 +13,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// The deterministic VM's clock, shared between the dispatcher and the VM.
+type Clock = Arc<Mutex<crate::run::VirtualClock>>;
+
 use futures::StreamExt;
 use rmcp_codemode::{
-    Budget, Engine, EngineError, HostCall, Outcome, OutputItem, RunContext, RunHandle,
-    ScriptOptions, ScriptResult, Space, SuspendState, SuspendingEngine, ToolHandle, Value,
-    extract_options, render_result_text_with_overflow,
+    Budget, Engine, EngineError, HostCall, OutputItem, RunContext, RunHandle, ScriptOptions,
+    ScriptResult, Space, SuspendState, SuspendingEngine, ToolHandle, Value, extract_options,
+    render_result_text_with_overflow,
 };
 use rquickjs::{AsyncContext, AsyncRuntime};
 
@@ -67,12 +71,20 @@ impl QuickJsEngine {
         context: &RunContext,
         dispatcher: Dispatcher,
     ) -> Result<ScriptResult, EngineError> {
-        self.run_with_sink(code, context, dispatcher, None, Default::default())
+        // One-shot runs build their own clock when the context asks for
+        // determinism (it stays at started_at_ms: nothing delivers).
+        let clock = context.deterministic.map(|determinism| {
+            Arc::new(Mutex::new(crate::run::VirtualClock::new(
+                determinism.started_at_ms,
+            )))
+        });
+        self.run_with_sink(code, context, dispatcher, None, Default::default(), clock)
             .await
     }
 
     /// [`run_with`](Self::run_with) with an explicit call sink (resume uses
     /// replay; one-shot and fresh suspending runs build theirs inline).
+    /// `clock` is the deterministic VM's clock, shared with the dispatcher.
     async fn run_with_sink(
         &self,
         code: &str,
@@ -80,6 +92,7 @@ impl QuickJsEngine {
         dispatcher: Dispatcher,
         sink_override: Option<crate::proxy::AsyncCallSink>,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        clock: Option<Arc<Mutex<crate::run::VirtualClock>>>,
     ) -> Result<ScriptResult, EngineError> {
         let started = std::time::Instant::now();
         let (code, options, budget) = apply_options(code, &context.budget);
@@ -156,6 +169,10 @@ impl QuickJsEngine {
                         &sink,
                         &initial_store,
                         &pending_store,
+                        &clock,
+                        context
+                            .deterministic
+                            .map_or(0, |determinism| determinism.seed),
                     );
                     if let Err(error) = result {
                         return Err(EngineError::Engine(error.to_string()));
@@ -221,20 +238,35 @@ impl SuspendingQuickJsEngine {
         context: &RunContext,
     ) -> Result<RunHandle, EngineError> {
         let (call_tx, call_rx) = futures::channel::mpsc::unbounded::<HostCall>();
-        let (delivery_tx, delivery_rx) = futures::channel::mpsc::unbounded::<(u64, Outcome)>();
+        let (delivery_tx, delivery_rx) =
+            futures::channel::mpsc::unbounded::<rmcp_codemode::Delivery>();
         let (result_tx, result_rx) = futures::channel::oneshot::channel::<ScriptResult>();
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let answer_deque: Arc<Mutex<std::collections::VecDeque<(u64, Outcome)>>> =
+        let answer_deque: crate::run::AnswerQueue =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let pump_sink = Arc::clone(&answer_deque);
         tokio::spawn(async move {
             let mut delivery_rx = delivery_rx;
             while let Some(answer) = delivery_rx.next().await {
-                pump_sink.lock().unwrap().push_back(answer);
+                pump_sink
+                    .lock()
+                    .unwrap()
+                    .push_back((answer.id, answer.outcome, answer.now_ms));
             }
         });
 
+        // The resumed run observes the original run's deterministic
+        // parameters (recorded with the state), falling back to the
+        // context's.
+        let clock = state
+            .deterministic
+            .or(context.deterministic)
+            .map(|determinism| {
+                Arc::new(Mutex::new(crate::run::VirtualClock::new(
+                    determinism.started_at_ms,
+                )))
+            });
         let replay = resumed_dispatcher(
             crate::run::ReplayState {
                 recorded: state.answered,
@@ -243,6 +275,7 @@ impl SuspendingQuickJsEngine {
             call_tx.clone(),
             Arc::clone(&answer_deque),
             Arc::clone(&in_flight),
+            clock.clone(),
         );
         let sink_dispatcher = replay.clone();
         let engine = QuickJsEngine {
@@ -265,7 +298,7 @@ impl SuspendingQuickJsEngine {
                 })
             };
             let result = engine
-                .run_with_sink(&state.code, &context, replay, Some(sink), in_flight)
+                .run_with_sink(&state.code, &context, replay, Some(sink), in_flight, clock)
                 .await;
             let outcome = match result {
                 Ok(result) => result,
@@ -282,14 +315,16 @@ impl SuspendingQuickJsEngine {
 fn resumed_dispatcher(
     state: crate::run::ReplayState,
     call_tx: futures::channel::mpsc::UnboundedSender<HostCall>,
-    answers: Arc<Mutex<std::collections::VecDeque<(u64, Outcome)>>>,
+    answers: crate::run::AnswerQueue,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    clock: Option<Clock>,
 ) -> Dispatcher {
     let host = Arc::new(crate::run::HostChannel {
         calls: call_tx,
         answers,
         next_id: std::sync::atomic::AtomicU64::new(0),
         in_flight,
+        clock: clock.clone(),
     });
     let past: crate::run::PastDispatcher = Arc::new(move |tool: ToolHandle, args: Value| {
         let host = Arc::clone(&host);
@@ -298,6 +333,7 @@ fn resumed_dispatcher(
     Dispatcher::Replay {
         state: Arc::new(Mutex::new(state)),
         past,
+        clock,
     }
 }
 
@@ -381,7 +417,8 @@ impl SuspendingEngine for SuspendingQuickJsEngine {
 impl SuspendingEngine for QuickJsEngine {
     async fn start(&self, code: &str, context: &RunContext) -> Result<RunHandle, EngineError> {
         let (call_tx, call_rx) = futures::channel::mpsc::unbounded::<HostCall>();
-        let (delivery_tx, delivery_rx) = futures::channel::mpsc::unbounded::<(u64, Outcome)>();
+        let (delivery_tx, delivery_rx) =
+            futures::channel::mpsc::unbounded::<rmcp_codemode::Delivery>();
         let (result_tx, result_rx) = futures::channel::oneshot::channel::<ScriptResult>();
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -392,27 +429,47 @@ impl SuspendingEngine for QuickJsEngine {
         // The host pushes answers through the RunHandle's mpsc sender; a
         // pump task forwards them into the dispatcher's deque (no lock held
         // across an await anywhere).
-        let answer_deque: Arc<Mutex<std::collections::VecDeque<(u64, Outcome)>>> =
+        let answer_deque: crate::run::AnswerQueue =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let pump_sink = Arc::clone(&answer_deque);
         tokio::spawn(async move {
             let mut delivery_rx = delivery_rx;
             while let Some(answer) = delivery_rx.next().await {
-                pump_sink.lock().unwrap().push_back(answer);
+                pump_sink
+                    .lock()
+                    .unwrap()
+                    .push_back((answer.id, answer.outcome, answer.now_ms));
             }
+        });
+        // The deterministic VM's clock, when the host asked for one; the
+        // dispatcher advances it with each delivered clock value.
+        let clock = context.deterministic.map(|determinism| {
+            Arc::new(Mutex::new(crate::run::VirtualClock::new(
+                determinism.started_at_ms,
+            )))
         });
         let dispatcher_channel: Dispatcher = Dispatcher::Host(Arc::new(crate::run::HostChannel {
             calls: call_tx,
             answers: Arc::clone(&answer_deque),
             next_id: std::sync::atomic::AtomicU64::new(0),
             in_flight: Arc::clone(&in_flight),
+            clock: clock.clone(),
         }));
         let engine = QuickJsEngine {
             overflow_dir: self.overflow_dir.clone(),
         };
         tokio::spawn(async move {
+            // run_with_sink with the SAME clock the dispatcher advances:
+            // the VM's Date reads what the host delivered.
             let result = match engine
-                .run_with(&code, &engine_ctx, dispatcher_channel)
+                .run_with_sink(
+                    &code,
+                    &engine_ctx,
+                    dispatcher_channel,
+                    None,
+                    in_flight,
+                    clock,
+                )
                 .await
             {
                 Ok(result) => result,

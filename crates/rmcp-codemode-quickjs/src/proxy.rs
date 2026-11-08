@@ -49,6 +49,8 @@ pub(crate) fn setup(
     dispatcher_sink: &AsyncCallSink,
     initial_store: &Arc<Mutex<BTreeMap<String, Value>>>,
     pending_store: &Arc<Mutex<BTreeMap<String, Value>>>,
+    deterministic: &Option<Arc<Mutex<crate::run::VirtualClock>>>,
+    seed: u32,
 ) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
 
@@ -290,7 +292,62 @@ pub(crate) fn setup(
         )?;
     }
 
+    if let Some(clock) = deterministic {
+        bind_deterministic_globals(ctx, clock, seed)?;
+    }
+
     bind_script_globals(ctx, space, namespaces)
+}
+
+/// Deterministic mode (pi's replay VM): `Date` reads the virtual clock,
+/// `Math.random` draws from a PRNG over the seed, and `WeakRef` /
+/// `FinalizationRegistry` do not exist (their scheduling is unobservable
+/// and would break replay).
+fn bind_deterministic_globals(
+    ctx: &rquickjs::Ctx<'_>,
+    clock: &Arc<Mutex<crate::run::VirtualClock>>,
+    seed: u32,
+) -> Result<(), rquickjs::Error> {
+    let globals = ctx.globals();
+    {
+        let clock = Arc::clone(clock);
+        globals.set(
+            "__virtualNow",
+            Func::from(move || clock.lock().unwrap().now_ms),
+        )?;
+    }
+    ctx.eval::<(), _>(
+        r#"
+globalThis.__rngState = {__seed} >>> 0;
+// mulberry32 (pi's PRNG): one 32-bit draw per call, [0, 1).
+globalThis.Math.random = () => {{
+    __rngState = (__rngState + 0x6d2b79f5) >>> 0;
+    let t = __rngState;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}};
+// `Date` reads the virtual clock: Date.now() and new Date() with no
+// arguments; every other constructor form passes through.
+const __RealDate = Date;
+const __VDate = function (...args) {{
+    if (new.target === undefined) return __RealDate(globalThis.__virtualNow());
+    if (args.length === 0) return Reflect.construct(__RealDate, [globalThis.__virtualNow()]);
+    return Reflect.construct(__RealDate, args);
+}};
+__VDate.prototype = __RealDate.prototype;
+__VDate.now = () => globalThis.__virtualNow();
+__VDate.parse = __RealDate.parse;
+__VDate.UTC = __RealDate.UTC;
+globalThis.Date = __VDate;
+// Unobservable scheduling has no place in a replayable run (pi removes
+// these in deterministic mode).
+delete globalThis.WeakRef;
+delete globalThis.FinalizationRegistry;
+"#
+        .replace("{__seed}", &seed.to_string()),
+    )?;
+    Ok(())
 }
 
 fn item_len(item: &OutputItem) -> usize {

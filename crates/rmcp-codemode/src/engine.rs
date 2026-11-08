@@ -35,6 +35,32 @@ use crate::{
 
 /// Everything one run needs: the tool space it may call, the resource
 /// budgets, and the namespace metadata for discovery.
+/// Deterministic-run parameters (pi's `deterministic: { startedAt, seed }`):
+/// the same script, start time, seed, tools, and delivered results produce
+/// the same observable behavior. The VM's clock starts at
+/// [`Determinism::started_at_ms`] and advances only with delivered results,
+/// never backwards; `Math.random` draws from a PRNG over [`Determinism::seed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Determinism {
+    /// The virtual clock's start, in ms since the epoch.
+    pub started_at_ms: u64,
+    /// The PRNG seed for `Math.random` (pi: a 32-bit unsigned integer).
+    pub seed: u32,
+}
+
+impl Determinism {
+    /// A determinism config.
+    pub fn new(started_at_ms: u64, seed: u32) -> Self {
+        Self {
+            started_at_ms,
+            seed,
+        }
+    }
+}
+
+/// Everything a script run needs: its tool space, budgets, store, and
+/// determinism settings.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct RunContext {
@@ -46,6 +72,9 @@ pub struct RunContext {
     /// The committed script store (`load` reads it; `store` writes commit
     /// here on success). Empty unless the host persists state.
     pub store: BTreeMap<String, Value>,
+    /// Deterministic-run parameters. `None` (the default) means the
+    /// script sees the host's real clocks.
+    pub deterministic: Option<Determinism>,
 }
 
 impl RunContext {
@@ -55,7 +84,14 @@ impl RunContext {
             space,
             budget: Budget::default(),
             store: BTreeMap::new(),
+            deterministic: None,
         }
+    }
+
+    /// Make the run deterministic (pi's replay mode).
+    pub fn with_determinism(mut self, determinism: Determinism) -> Self {
+        self.deterministic = Some(determinism);
+        self
     }
 
     /// Set the committed store (`load`'s initial view).
@@ -151,11 +187,45 @@ pub struct HostCall {
     pub execute: ToolFn,
 }
 
+/// One delivered answer: the call id, its outcome, and optionally the
+/// clock value the deterministic VM reads while applying it (pi's
+/// `deliver(seq, now, id, outcome)`).
+#[non_exhaustive]
+pub struct Delivery {
+    /// The call's engine id.
+    pub id: u64,
+    /// The outcome to apply.
+    pub outcome: Outcome,
+    /// The clock value for the deterministic VM, ms since the epoch.
+    /// Ignored in non-deterministic runs.
+    pub now_ms: Option<u64>,
+}
+
+impl Delivery {
+    /// Deliver an answer without a clock value.
+    pub fn new(id: u64, outcome: Outcome) -> Self {
+        Self {
+            id,
+            outcome,
+            now_ms: None,
+        }
+    }
+
+    /// Deliver an answer with the clock value the VM reads.
+    pub fn with_now(id: u64, outcome: Outcome, now_ms: u64) -> Self {
+        Self {
+            id,
+            outcome,
+            now_ms: Some(now_ms),
+        }
+    }
+}
+
 impl RunHandle {
     /// Assemble a run handle from its channel halves.
     pub fn new(
         next_call: futures::channel::mpsc::UnboundedReceiver<HostCall>,
-        deliveries: futures::channel::mpsc::UnboundedSender<(u64, Outcome)>,
+        deliveries: futures::channel::mpsc::UnboundedSender<Delivery>,
         result: futures::channel::oneshot::Receiver<ScriptResult>,
     ) -> Self {
         Self {
@@ -192,7 +262,7 @@ pub struct RunHandle {
     pub next_call: futures::channel::mpsc::UnboundedReceiver<HostCall>,
     /// Answers flow back to the engine; a dropped sender cancels the
     /// unanswered calls (pi: the record stays `cancelled`).
-    pub deliveries: futures::channel::mpsc::UnboundedSender<(u64, Outcome)>,
+    pub deliveries: futures::channel::mpsc::UnboundedSender<Delivery>,
     /// The run's result, once it ends.
     pub result: futures::channel::oneshot::Receiver<ScriptResult>,
 }
@@ -209,6 +279,11 @@ pub struct SuspendState {
     /// Calls answered before the pause, in order: id, name, and the outcome
     /// to replay. A resumed run replays these instead of executing.
     pub answered: Vec<AnsweredCall>,
+    /// The run's deterministic parameters, so a resumed run observes the
+    /// same clocks and randomness as the original (pi: the host saves
+    /// startedAt and seed with the session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deterministic: Option<Determinism>,
 }
 
 impl SuspendState {
@@ -217,7 +292,14 @@ impl SuspendState {
         Self {
             code: code.into(),
             answered,
+            deterministic: None,
         }
+    }
+
+    /// Record the run's deterministic parameters with the state.
+    pub fn with_determinism(mut self, determinism: Determinism) -> Self {
+        self.deterministic = Some(determinism);
+        self
     }
 }
 
@@ -232,6 +314,10 @@ pub struct AnsweredCall {
     pub name: String,
     /// The recorded outcome.
     pub outcome: RecordedOutcome,
+    /// The clock value the deterministic VM read while applying this
+    /// outcome; `None` in non-deterministic runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ms: Option<u64>,
 }
 
 impl AnsweredCall {
@@ -241,7 +327,15 @@ impl AnsweredCall {
             id,
             name: name.into(),
             outcome,
+            now_ms: None,
         }
+    }
+
+    /// Record the clock value the deterministic VM read while applying
+    /// this outcome.
+    pub fn with_now(mut self, now_ms: u64) -> Self {
+        self.now_ms = Some(now_ms);
+        self
     }
 }
 

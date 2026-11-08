@@ -39,8 +39,8 @@ pub use budget::{
 };
 pub use catalog::{Catalog, Described, Mode};
 pub use engine::{
-    AnsweredCall, Decision, Engine, EngineError, HostCall, Outcome, RecordedOutcome, RunContext,
-    RunHandle, SuspendState, SuspendingEngine,
+    AnsweredCall, Decision, Delivery, Determinism, Engine, EngineError, HostCall, Outcome,
+    RecordedOutcome, RunContext, RunHandle, SuspendState, SuspendingEngine,
 };
 pub use identity::normalize_identifier;
 pub use result::{

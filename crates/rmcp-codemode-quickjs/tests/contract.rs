@@ -202,7 +202,7 @@ async fn suspending_run_yields_calls_to_the_host() {
     // Deny: the script sees the error.
     handle
         .deliveries
-        .unbounded_send((
+        .unbounded_send(rmcp_codemode::Delivery::new(
             call.id,
             Outcome::Fail {
                 message: "denied by user".to_owned(),
@@ -239,7 +239,10 @@ async fn suspending_run_can_allow_calls() {
         let outcome = (call.execute)(call.args.clone()).await;
         handle
             .deliveries
-            .unbounded_send((call.id, Outcome::Deliver(outcome.unwrap())))
+            .unbounded_send(rmcp_codemode::Delivery::new(
+                call.id,
+                Outcome::Deliver(outcome.unwrap()),
+            ))
             .unwrap();
     }
     let result = handle.result.await.unwrap();
@@ -275,7 +278,10 @@ async fn suspended_state_replays_recorded_calls() {
     assert_eq!(first.name, "a.first");
     handle
         .deliveries
-        .unbounded_send((first.id, Outcome::Deliver(json!("first-result"))))
+        .unbounded_send(rmcp_codemode::Delivery::new(
+            first.id,
+            Outcome::Deliver(json!("first-result")),
+        ))
         .unwrap();
     // Give the dispatcher a moment to consume the answer, then stop.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -302,7 +308,10 @@ async fn suspended_state_replays_recorded_calls() {
     );
     resumed
         .deliveries
-        .unbounded_send((second.id, Outcome::Deliver(json!("second-result"))))
+        .unbounded_send(rmcp_codemode::Delivery::new(
+            second.id,
+            Outcome::Deliver(json!("second-result")),
+        ))
         .unwrap();
     let result = resumed.result.await.unwrap();
     assert!(result.ok, "{:?}", result.error);
@@ -427,4 +436,135 @@ async fn exit_ends_successfully_even_when_swallowed() {
 fn flat_helper(segments: &[&str]) -> String {
     let owned: Vec<String> = segments.iter().map(|s| (*s).to_owned()).collect();
     flat_identifier(&owned)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn determinism_same_seed_same_clock_same_script_same_results() {
+    // pi's replay contract: the same script, startedAt, seed, tools, and
+    // delivered results produce the same observable behavior.
+    let script = r#"
+        const a = Math.random();
+        const t1 = Date.now();
+        const x = await tools.a.first({});
+        const b = Math.random();
+        const t2 = Date.now();
+        return { a, t1, x, b, t2 };
+    "#;
+    let run = || async {
+        let space = space_with(vec![echo_tool("a.first", json!({ "v": 1 }))]);
+        let context =
+            RunContext::new(space).with_determinism(rmcp_codemode::Determinism::new(1_000_000, 42));
+        let mut handle = SuspendingQuickJsEngine::from_engine(QuickJsEngine::default())
+            .start(script, &context)
+            .await
+            .unwrap();
+        let call = handle.next_call.next().await.unwrap();
+        // The host delivers clock values with its answers (pi's
+        // deliver(seq, now, id, outcome)).
+        handle
+            .deliveries
+            .unbounded_send(rmcp_codemode::Delivery::with_now(
+                call.id,
+                Outcome::Deliver(json!({ "v": 1 })),
+                1_000_500,
+            ))
+            .unwrap();
+        handle.result.await.unwrap()
+    };
+    let first = run().await;
+    let second = run().await;
+    assert!(
+        first.ok && second.ok,
+        "{:?} {:?}",
+        first.error,
+        second.error
+    );
+    assert_eq!(first.value, second.value, "replay must align exactly");
+    let value = first.value.clone().unwrap();
+    assert_eq!(value["t1"], 1_000_000, "clock starts at started_at");
+    assert_eq!(value["t2"], 1_000_500, "clock advances with the delivery");
+    assert!(value["a"].as_f64().unwrap() != value["b"].as_f64().unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn determinism_seed_controls_randomness_and_clock_never_goes_backwards() {
+    let script = r#"return [Math.random(), Math.random(), Date.now()];"#;
+    let observe = |seed: u32| async move {
+        let engine = QuickJsEngine::default();
+        let context = RunContext::new(Space::new())
+            .with_determinism(rmcp_codemode::Determinism::new(7, seed));
+        engine.execute(script, &context).await.unwrap()
+    };
+    let a = observe(42).await;
+    let b = observe(42).await;
+    let c = observe(43).await;
+    assert_eq!(a.value, b.value, "same seed, same draws");
+    assert_ne!(a.value, c.value, "different seed, different draws");
+    // The clock without deliveries stays at started_at.
+    assert_eq!(a.value.unwrap()[2], 7);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_run_replays_recorded_clock_values() {
+    // A paused run records the clock values of its answered calls; the
+    // resumed run's virtual clock follows the same trajectory (pi: the
+    // host saves startedAt and seed with the session).
+    let script = r#"
+        const t1 = Date.now();
+        await tools.a.first({});
+        const t2 = Date.now();
+        await tools.a.second({});
+        const t3 = Date.now();
+        return { t1, t2, t3 };
+    "#;
+    let engine = SuspendingQuickJsEngine::from_engine(QuickJsEngine::default());
+    let space = space_with(vec![
+        echo_tool("a.first", json!(1)),
+        echo_tool("a.second", json!(2)),
+    ]);
+    let determinism = rmcp_codemode::Determinism::new(5_000, 9);
+    let context = RunContext::new(space).with_determinism(determinism);
+
+    // Run 1: answer both calls with clock values, keeping the recording.
+    let mut handle = engine.start(script, &context).await.unwrap();
+    let mut answered = Vec::new();
+    for (id, now) in [(0u64, 5_100u64), (1, 5_300)] {
+        let call = handle.next_call.next().await.unwrap();
+        answered.push(
+            rmcp_codemode::AnsweredCall::new(
+                id,
+                call.name.clone(),
+                rmcp_codemode::RecordedOutcome::Ok(json!(id + 1)),
+            )
+            .with_now(now),
+        );
+        handle
+            .deliveries
+            .unbounded_send(rmcp_codemode::Delivery::with_now(
+                call.id,
+                Outcome::Deliver(json!(id + 1)),
+                now,
+            ))
+            .unwrap();
+    }
+    let first = handle.result.await.unwrap();
+    assert!(first.ok, "{:?}", first.error);
+    let observed: Vec<_> = first
+        .value
+        .clone()
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    assert_eq!(observed, vec![json!(5_000), json!(5_100), json!(5_300)]);
+
+    // Run 2: replay from a state carrying the recording. Both calls are
+    // in the recording, so the replay needs no further answers.
+    let state = SuspendState::new(script, answered).with_determinism(determinism);
+    let resumed = engine.resume(state, &context).await.unwrap();
+    let second = resumed.result.await.unwrap();
+    assert!(second.ok, "{:?}", second.error);
+    assert_eq!(first.value, second.value, "replay observes the same clocks");
 }

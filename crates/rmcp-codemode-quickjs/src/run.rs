@@ -31,11 +31,19 @@ pub(crate) enum Dispatcher {
     Host(Arc<HostChannel>),
     /// Answer from the recording (by issue order); calls past the recording
     /// yield to the wrapped dispatcher (boxed to break the async recursion).
+    /// The deterministic VM's clock, when the run is one: replay answers
+    /// advance it with their recorded values.
     Replay {
         state: Arc<Mutex<ReplayState>>,
         past: PastDispatcher,
+        clock: Option<Arc<Mutex<VirtualClock>>>,
     },
 }
+
+/// The answer queue: (call id, outcome, optional clock value), a plain
+/// mutex-protected deque so no lock is ever held across an await.
+pub(crate) type AnswerQueue =
+    Arc<Mutex<std::collections::VecDeque<(u64, rmcp_codemode::Outcome, Option<u64>)>>>;
 
 /// The dispatcher for calls past a recording, boxed to break async
 /// recursion ([`Dispatcher::dispatch`] is recursive through this).
@@ -52,10 +60,36 @@ pub(crate) struct HostChannel {
     /// is a pending tool call; waiting for the host is legal).
     pub in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Answers pushed by the host, consumed by the dispatcher (a deque, so
-    /// no lock is ever held across an await).
-    pub answers: Arc<Mutex<std::collections::VecDeque<(u64, rmcp_codemode::Outcome)>>>,
+    /// no lock is ever held across an await). Each carries the clock value
+    /// the deterministic VM reads, if any.
+    pub answers: AnswerQueue,
     /// Ids for yielded calls, unique within the run.
     pub next_id: std::sync::atomic::AtomicU64,
+    /// The deterministic VM's clock, when the run is deterministic.
+    pub clock: Option<Arc<Mutex<VirtualClock>>>,
+}
+
+/// The deterministic VM's clock (pi's virtual clock): it starts at
+/// `started_at_ms` and advances only with delivered results, never
+/// backwards — a resumed host's clock may be behind the one that started
+/// the run.
+#[derive(Debug, Default)]
+pub(crate) struct VirtualClock {
+    pub now_ms: u64,
+}
+
+impl VirtualClock {
+    /// A clock starting at `started_at_ms`.
+    pub(crate) fn new(started_at_ms: u64) -> Self {
+        Self {
+            now_ms: started_at_ms,
+        }
+    }
+
+    /// Advance to `now_ms`, never backwards.
+    pub(crate) fn advance(&mut self, now_ms: u64) {
+        self.now_ms = self.now_ms.max(now_ms);
+    }
 }
 
 /// Replay bookkeeping: recorded calls in issue order.
@@ -91,14 +125,22 @@ impl Dispatcher {
                     // pop under the lock, never hold it across an await.
                     let popped = channel.answers.lock().unwrap().pop_front();
                     match popped {
-                        Some((answered_id, rmcp_codemode::Outcome::Deliver(value)))
+                        Some((answered_id, rmcp_codemode::Outcome::Deliver(value), now_ms))
                             if answered_id == id =>
                         {
+                            if let (Some(clock), Some(now)) = (&channel.clock, now_ms) {
+                                clock.lock().unwrap().advance(now);
+                            }
                             return Ok(value);
                         }
-                        Some((answered_id, rmcp_codemode::Outcome::Fail { message, .. }))
-                            if answered_id == id =>
-                        {
+                        Some((
+                            answered_id,
+                            rmcp_codemode::Outcome::Fail { message, .. },
+                            now_ms,
+                        )) if answered_id == id => {
+                            if let (Some(clock), Some(now)) = (&channel.clock, now_ms) {
+                                clock.lock().unwrap().advance(now);
+                            }
                             return Err(message);
                         }
                         Some(_) => continue,
@@ -107,7 +149,7 @@ impl Dispatcher {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
             }
-            Self::Replay { state, past } => {
+            Self::Replay { state, past, clock } => {
                 // Read and advance under the lock; never hold the guard
                 // across the tool await.
                 let recorded = {
@@ -122,6 +164,9 @@ impl Dispatcher {
                     // a second time).
                     return past(tool.clone(), args).await;
                 };
+                if let (Some(clock), Some(now)) = (&clock, answered.now_ms) {
+                    clock.lock().unwrap().advance(now);
+                }
                 // RecordedOutcome is non_exhaustive: inspect through its
                 // serialized (externally tagged) shape so unknown variants
                 // degrade to a failure rather than a panic.

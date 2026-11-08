@@ -17,7 +17,7 @@ pub struct UpstreamOptions {
     /// The namespace the upstream's tools enter under: `ns.tool`.
     pub namespace: String,
     /// The exposure applied to every upstream tool. Default:
-    /// [`Exposure::CodeModeOnly`] — schemas stay out of the model's
+    /// [`Exposure::CodeModeOnly`](crate::space::Exposure::CodeModeOnly) — schemas stay out of the model's
     /// context; the script discovers them (Anthropic's deferred loading).
     pub exposure: crate::space::Exposure,
     /// Replace the namespace's description (upstream handshake
@@ -27,7 +27,7 @@ pub struct UpstreamOptions {
 
 impl UpstreamOptions {
     /// Options for one upstream under `namespace`. The exposure defaults
-    /// to [`Exposure::CodeModeOnly`] — that is the point of code mode:
+    /// to [`Exposure::CodeModeOnly`](crate::space::Exposure::CodeModeOnly) — that is the point of code mode:
     /// upstream schemas stay out of the model's context unless a host
     /// overrides them.
     pub fn new(namespace: impl Into<String>) -> Self {

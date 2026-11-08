@@ -411,14 +411,19 @@ where
                 // A non_exhaustive enum: unknown variants skip recording.
                 _ => continue,
             };
-            answered.push(rmcp_codemode::AnsweredCall::new(
-                call.id,
-                call.name.clone(),
-                recorded,
-            ));
+            // pi: the host passes the clock value with each delivery, so
+            // a deterministic replay reads the same times.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default();
+            answered.push(
+                rmcp_codemode::AnsweredCall::new(call.id, call.name.clone(), recorded)
+                    .with_now(now_ms),
+            );
             handle
                 .deliveries
-                .unbounded_send((call.id, outcome))
+                .unbounded_send(rmcp_codemode::Delivery::with_now(call.id, outcome, now_ms))
                 .map_err(|_| McpError::internal_error("the run stopped answering", None))?;
         }
     }
