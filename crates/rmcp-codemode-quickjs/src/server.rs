@@ -1,7 +1,7 @@
 //! The `codemode` MCP server: what a host sees.
 //!
 //! One tool with a `script` parameter (pi/OpenCode/CF all converge here).
-//! [`CodemodeServer`] wires a [`SuspendingQuickJsEngine`] (or any engine)
+//! [`CodemodeServer`] wires a [`SuspendingQuickJsEngine`](crate::engine::SuspendingQuickJsEngine) (or any engine)
 //! to rmcp: exposure mixing, host-native tools, approval routing, and the
 //! store's persistence.
 

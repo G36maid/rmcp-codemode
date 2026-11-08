@@ -89,7 +89,7 @@ pub type NamespaceKey = String;
 
 /// Approval/undo annotations for one tool (Cloudflare's annotations).
 /// The shape is stored so hosts can honor it; the engine treats every call
-/// identically — pausing is the host's decision at the [`HostCall`] boundary.
+/// identically — pausing is the host's decision at the [`HostCall`](crate::engine::HostCall) boundary.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 #[non_exhaustive]

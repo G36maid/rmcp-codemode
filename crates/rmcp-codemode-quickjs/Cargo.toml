@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-codemode-quickjs"
-description = "QuickJS engine for rmcp-codemode: sandbox, suspending runs, deterministic replay"
+description = "QuickJS engine for rmcp-codemode: sandbox, suspending runs, approval replay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

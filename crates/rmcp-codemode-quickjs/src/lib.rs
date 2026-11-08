@@ -1,6 +1,7 @@
 //! The QuickJS engine for rmcp-codemode.
 //!
-//! Implements the core's [`Engine`] and [`SuspendingEngine`] contracts with
+//! Implements the core's [`Engine`](rmcp_codemode::Engine) and
+//! [`SuspendingEngine`](rmcp_codemode::SuspendingEngine) contracts with
 //! rquickjs: one fresh VM per run, the script as an async function body, and
 //! the tool space as a namespaced `tools` proxy.
 //!
