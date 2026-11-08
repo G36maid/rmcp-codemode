@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rmcp-codemode", "crates/rmcp-codemode-quickjs"]
+members = ["crates/rmcp-codemode", "crates/rmcp-codemode-quickjs", "examples/codemode-demo"]
 resolver = "3"
 
 [workspace.dependencies]

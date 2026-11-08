@@ -1,0 +1,16 @@
+[package]
+name = "codemode-demo"
+description = "A runnable codemode demo: two upstream MCP tools piped inside one script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp = { version = "3.9", default-features = false, features = ["client", "server"] }
+rmcp-codemode = { workspace = true }
+rmcp-codemode-quickjs = { path = "../../crates/rmcp-codemode-quickjs" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process"] }
+
+[lints]
+workspace = true

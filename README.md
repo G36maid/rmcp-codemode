@@ -10,15 +10,15 @@ Code mode for [RMCP](https://github.com/modelcontextprotocol/rust-sdk) — the t
 
 </div>
 
-Expose upstream MCP servers' tools to any host as a **single `codemode` script tool**. The model writes a short JavaScript program; upstream tools run inside a QuickJS sandbox and their intermediate results never round-trip through the model. Per-tool exposure metadata (`direct` / `deferred` / `codemode`) decides what else the host sees.
+Expose upstream MCP servers' tools to any host as a **single `codemode` script tool**. The model writes a short JavaScript program; upstream tools run inside a QuickJS sandbox and their intermediate results never round-trip through the model. Per-tool exposure metadata (`direct` / `deferred` / `codemode`) decides what else the host sees. Tools that need a human approve first: the run **pauses**, the host approves, and the run **resumes by replaying** the calls already made.
 
-Semantics follow pi's shipped `codemode` tool ([docs](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/codemode.md)), with OpenCode's [`packages/codemode`](https://github.com/anomalyco/opencode/blob/dev/packages/codemode) as the second reference for the aggregation side and Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/) as the architecture sketch. The crate stays outside the SDK's workspace on purpose: QuickJS cannot meet the SDK's dependency policy (see [`DEPENDENCY_POLICY.md`](DEPENDENCY_POLICY.md)), and exposure logic belongs to hosts — this crate is the input, not the ask.
+The design is the union of three shipped codemode implementations, expressed as one model: **pi**'s script contract and host-controlled runs, **OpenCode**'s hierarchical tool space and paged discovery, **Cloudflare**'s connector namespaces, approval annotations, and replay states. Engine-agnostic core, one QuickJS backend.
 
 ## Why
 
 - **Schemas are re-sent every turn.** Anthropic measured ~77K tokens before the first user message with 50+ MCP tools, dropping to ~8.7K with deferred loading ([Advanced tool use](https://www.anthropic.com/research/advanced-tool-use)). Servers with big surfaces (e.g. [ghidra-mcp](https://github.com/bethington/ghidra-mcp), 209 tools) implement their own lazy loading because hosts don't provide it.
 - **Tool results always round-trip through the model**, even when they are just input for the next tool call. Anthropic measured 150K → 2K tokens for exactly this pattern ([Code execution with MCP](https://www.anthropic.com/research/code-execution-with-mcp)).
-- **Server authors can't declare intent.** Every host invents its own policy; nothing in the SDK carries it. Codex's exposure enum has `Direct`, `Deferred`, and `CodeModeOnly` among its six variants ([`codex-rs/tools`](https://github.com/openai/codex/blob/main/codex-rs/tools/src/tool_executor.rs)) and Anthropic standardizes deferred discovery ([Tool Search Tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)).
+- **Server authors can't declare intent.** Every host invents its own policy; nothing in the SDK carries it. Codex reserves the same three states (`ToolExposure::Direct | Deferred | CodeModeOnly`) and Anthropic standardizes deferred discovery ([Tool Search Tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)).
 
 Code mode solves the first two problems in one mechanism: tool schemas stay out of the context (tools are functions, deferred by default), and intermediate results stay inside the script.
 
@@ -26,8 +26,8 @@ Code mode solves the first two problems in one mechanism: tool schemas stay out 
 
 | Crate | Purpose |
 |---------|-------------|
-| [`rmcp-codemode`](crates/rmcp-codemode) | Core, engine-agnostic: [`ToolExposure`](crates/rmcp-codemode/src/exposure.rs), the aggregated [`Registry`](crates/rmcp-codemode/src/registry.rs), the BM25 [`SearchIndex`](crates/rmcp-codemode/src/search.rs), the [`Aggregator`](crates/rmcp-codemode/src/aggregate.rs) (connect upstreams → registry → dispatch), plus the script contract — [`ScriptResult`](crates/rmcp-codemode/src/result.rs) and its model-facing rendering, TypeScript [`signature`](crates/rmcp-codemode/src/signature.rs) rendering, and tool-path [`identity`](crates/rmcp-codemode/src/identity.rs) rules, and pluggable [`NamingConvention`](crates/rmcp-codemode/src/naming.rs)s for host-specific tool spellings |
-| [`rmcp-codemode-quickjs`](crates/rmcp-codemode-quickjs) | The QuickJS binding: the per-run VM ([`sandbox`](crates/rmcp-codemode-quickjs/src/sandbox.rs)), the globals [`bridge`](crates/rmcp-codemode-quickjs/src/bridge.rs), and the [`CodemodeServer`](crates/rmcp-codemode-quickjs/src/server.rs) — a drop-in `ServerHandler` exposing exactly one `codemode` tool |
+| [`rmcp-codemode`](crates/rmcp-codemode) | Engine-agnostic core: the tool [`Space`](crates/rmcp-codemode/src/space.rs) (segments + namespace metadata + exposure), the [`Catalog`](crates/rmcp-codemode/src/catalog.rs) (inline budget, paged search, describe), the [`Budget`](crates/rmcp-codemode/src/budget.rs), the script contract and its rendering ([`result`](crates/rmcp-codemode/src/result.rs), [`signature`](crates/rmcp-codemode/src/signature.rs), [`identity`](crates/rmcp-codemode/src/identity.rs)), and the [`Engine`](crates/rmcp-codemode/src/engine.rs) contracts — including `SuspendingEngine`, the host-controlled seam that approval and replay build on |
+| [`rmcp-codemode-quickjs`](crates/rmcp-codemode-quickjs) | The QuickJS engine: fresh VM per run, the script bridge, suspending runs with replay, and the [`CodemodeServer`](crates/rmcp-codemode-quickjs/src/server.rs) — a drop-in rmcp `ServerHandler` exposing exactly one `codemode` tool |
 
 ## Transports
 
@@ -35,74 +35,67 @@ The transport layer is rmcp's, so everything rmcp connects to, this crate aggreg
 
 | Direction | Transports |
 |:-:|---|
-| **Upstream (client side)** | `TokioChildProcess` (spawn an MCP server binary), Streamable HTTP, or any in-process duplex — anything implementing rmcp's `IntoTransport` |
+| **Upstream (client side)** | `TokioChildProcess` (spawn an MCP server binary), Streamable HTTP, or any in-process duplex |
 | **Downstream (server side)** | `stdio` for CLI hosts, Streamable HTTP for networked hosts, or any in-process duplex (tests use this) |
 
 ## Usage
 
-Connect upstream servers, optionally mix in host-native tools, and serve everything as one `codemode` tool:
+Build a tool space from MCP upstreams and host-native tools, and serve it as one `codemode` tool:
 
 ```rust,ignore
 use std::sync::Arc;
 use rmcp::{ServiceExt, transport::{TokioChildProcess, stdio}};
-use rmcp_codemode::aggregate::{Aggregator, UpstreamConfig};
-use rmcp_codemode::exposure::ToolExposure;
-use rmcp_codemode_quickjs::server::{CodemodeServer, NativeTool};
+use rmcp_codemode::{Exposure, NamespaceMeta, Space, ToolHandle};
+use rmcp_codemode_quickjs::{CodemodeServer, NativeTool, QuickJsEngine, FileStorePersister};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Connect upstreams; each gets a namespace and an exposure.
-    let aggregator = Aggregator::builder()
-        .upstream(UpstreamConfig {
-            namespace: "github".into(),
-            exposure: ToolExposure::CodeModeOnly, // callable from scripts only
-            description: Some("GitHub API".into()),
-            transport: move || async {
-                Ok(().serve(TokioChildProcess::new(
-                    tokio::process::Command::new("npx")
-                        .args(["-y", "@modelcontextprotocol/server-github"]),
-                )?).await?)
-            },
-        })
-        .upstream(UpstreamConfig {
-            namespace: "fs".into(),
-            exposure: ToolExposure::Direct, // also listed to the model
-            description: None,
-            transport: move || async {
-                Ok(().serve(TokioChildProcess::new(
-                    tokio::process::Command::new("npx")
-                        .args(["-y", "@modelcontextprotocol/server-filesystem"]),
-                )?).await?)
-            },
-        })
-        .connect()
-        .await?;
+    // 1. Connect an upstream MCP server (any rmcp transport) and register
+    //    its tools under a namespace. The server's handshake `instructions`
+    //    become the namespace's guidance automatically.
+    let github = ().serve(TokioChildProcess::new(
+        tokio::process::Command::new("npx")
+            .args(["-y", "@modelcontextprotocol/server-github"]),
+    )?)
+    .await?;
+    let mut space = Space::new();
+    space.set_namespace(
+        "github".into(),
+        NamespaceMeta::with_description("GitHub repositories and issues"),
+    );
+    for tool in github.peer().list_all_tools().await? {
+        space.insert(ToolHandle::new(
+            format!("github.{}", tool.name).split('.').map(str::to_owned).collect(),
+            tool.description.clone().unwrap_or_default(),
+            Arc::new(move |args| {
+                // dispatch to github.peer().call_tool(...)
+                #![allow(unused)]
+                Box::pin(async { Ok(json!({})) })
+            }),
+        ))?;
+    }
 
-    // 2. Mix in host-native tools (non-MCP: read, edit, bash, ...) — they
-    //    become tools.<path> alongside every MCP tool, with the same
-    //    discovery and declarations. Default exposure is CodeModeOnly.
-    let native = vec![
-        NativeTool::new("bash", "Run a shell command", |args| async move {
-            run_shell(args["command"].as_str().unwrap_or(""))
+    // 2. Host-native tools enter the same way. Default exposure is
+    //    CodeModeOnly; Direct also lists them to the host.
+    let native = NativeTool::new("bash", "Run a shell command", |args| {
+        Box::pin(async move {
+            Ok(json!({ "output": run_shell(args["command"].as_str().unwrap_or("")) }))
         })
-        .with_input_schema(json!({
-            "type": "object",
-            "properties": { "command": { "type": "string" } },
-            "required": ["command"]
-        })),
-    ];
+    });
 
-    // 3. Serve the aggregated registry as one `codemode` tool.
-    let server = CodemodeServer::from_aggregator(Arc::new(aggregator))
-        .with_native_tools(native);
+    // 3. Serve everything as one `codemode` tool. The store persists across
+    //    calls (and restarts) through the persister.
+    let server = CodemodeServer::new(QuickJsEngine::default(), space)
+        .with_native_tools(vec![native])
+        .with_store_persistence(Arc::new(FileStorePersister::new("codemode-store.json")));
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
     Ok(())
 }
 ```
 
-The host (and the model) sees exactly one tool. This is the whole integration for a host like Zed: connect upstream MCP servers, aggregate, serve. Sandboxing, discovery, exposure routing, and result formatting are the crate's job.
+The host (and the model) sees exactly one tool:
 
 ```json
 {"name": "codemode", "inputSchema": {"properties": {"script": {"type": "string"}}}}
@@ -112,13 +105,11 @@ A model turn looks like this — two upstream calls pipe together, and only the 
 
 ```js
 // script
-const cities = await tools.weather.list_cities({});
-const readings = await Promise.all(
-    cities.map((city) => tools.weather.get_temperature({ city }))
-);
-const coldest = readings.reduce((a, b) => (b.celsius < a.celsius ? b : a));
-text(`coldest: ${coldest.city} at ${coldest.celsius}C`);
-return { coldest: coldest.city };
+const cities = await tools.github.list_issues({ state: "open" });
+const readings = await Promise.all(cities.map((issue) => tools.github.get_issue({ id: issue.id })));
+const oldest = readings.reduce((a, b) => (a.created_at < b.created_at ? a : b));
+text(`oldest: ${oldest.title}`);
+return { count: readings.length, oldest: oldest.title };
 ```
 
 ## The script environment
@@ -127,63 +118,61 @@ The script is the body of an async function: top-level `await` and `return` work
 
 | Global | Purpose |
 |---|---|
-| `tools.<namespace>.<tool>(args)` | Every registered tool — upstream MCP and host-native alike — as namespaced promise-returning functions. Unknown paths fail with close-match suggestions (`websearch` → did you mean `web-search`?). |
+| `tools.<namespace>.<tool>(args)` | Every registered tool — MCP and host-native alike — as namespaced promise-returning functions. Unknown paths fail with pi's guard message (close-match suggestions: `websearch` → did you mean `web_search`?). |
 | `text(value)` | Append a text item to the output. |
-| `image(dataUri)` | Append an image (base64 data URI) to the output; it also becomes an MCP image content block. |
+| `image(dataUri)` | Append an image (base64 data URI); it also becomes an MCP image content block. |
 | `console.log/info/warn/error/debug` | Console lines, returned in one `<console_output>` block. |
-| `ALL_TOOLS` | `{ name, description }` for every callable tool, including ones the description does not list. |
-| `searchTools(query, { limit?, namespace?, offset? })` | BM25-ranked discovery over names and descriptions, paged: `{ items, remaining, next }` (pi's default limit 8; empty query lists in path order). |
-| `describeTool(name)` | The tool's description and TypeScript declaration, rendered from its JSON Schema. |
-| `describeNamespace(name)` | `{ name, description?, instructions?, tools }` (pi's shape) — resolves through the namespace's own name **and its aliases** (`describeNamespace("docs")` finds `mcp__docs`). |
-| `store(key, value)` / `load(key)` | Small JSON values kept across codemode calls; writes commit only when the script succeeds. Back it with your own session persistence via `with_store_persistence`. |
+| `ALL_TOOLS` | `{ name, description }` for every callable tool. |
+| `searchTools(query, { limit?, namespace?, offset? })` | BM25-ranked discovery, paged: `{ items, remaining, next }` (default limit 8). |
+| `describeTool(name)` | Description plus TypeScript declaration, rendered from the JSON Schemas. |
+| `describeNamespace(name)` | `{ name, description?, instructions?, tools }` — resolves through aliases (`describeNamespace("docs")` finds `mcp__docs`). |
+| `store(key, value)` / `load(key)` | Small JSON values kept across codemode calls; writes commit only when the script succeeds. Back it with a persister for restart survival. |
 | `exit()` | End the script successfully — even when a try/catch swallows it. |
 | `return value` | A top-level `return` adds the value like `text()`. |
 | `// @options: {...}` | Optional first line: `{"max_output_tokens": ..., "timeout_ms": ...}`. |
 
-Nothing else: no timers, `fetch`, `require`, `process`, or file system — scripts reach the outside world only through tool calls. The VM has a heap limit (256 MB default); allocations past it throw `InternalError: out of memory`.
+Nothing else: no timers, `fetch`, `require`, `process`, or file system — scripts reach the outside world only through tool calls. The VM has a heap limit (256 MB default).
 
 ### Runtime semantics (pi's model)
 
 - Each script runs in a **fresh QuickJS VM**: a runaway or failed script cannot poison the next run, and unawaited tool calls are cancelled when the script ends.
-- A script waiting on a promise nothing can settle fails immediately (there are no timers).
+- A script waiting on a promise nothing can settle fails **immediately** (there are no timers).
 - Pure-JS busy loops are preempted at the deadline by the VM's interrupt handler.
-- Scripts beyond the worker limit (2 by default; `with_max_workers`) queue in arrival order and fail without running if no worker frees up in time.
+- Scripts beyond the worker limit (2 by default; `Budget::max_workers`) queue in arrival order and fail without running if no worker frees up in time.
 - Over-budget output keeps its start and end; the full text is written to a file whose path is included in the result.
 - The result follows pi's format: `Script completed`/`Script failed` with wall time, `==> text N/M <==` markers, one `<console_output>` block, and `Script error:` on failure.
 
 ## Exposure model
 
-| Exposure | In `tools/list` | Callable by host | Callable in scripts | Discovery |
-|---|---|---|---|---|
-| `Direct` | yes | yes | yes | — |
-| `Deferred` | no | yes (guidance error) | yes | via `SearchIndex` |
-| `CodeModeOnly` | no | no | yes | via `ALL_TOOLS` / `SearchIndex` |
+| Exposure | In `tools/list` | Callable by host | Callable in scripts |
+|---|---|---|---|
+| `Direct` | yes | yes | yes |
+| `Deferred` | no | yes (guidance error) | yes |
+| `CodeModeOnly` | no | no | yes |
 
-How the states present at the server boundary (the mixing pi and OpenCode both ship):
-
-- `Direct` tools appear in the host's `tools/list` (`CodemodeMode::On`) **and** are declared inline in the `codemode` description — TypeScript, grouped by namespace, within a 3000-token budget (pi's `codemode.inlineBudget`); declarations that do not fit are found via `searchTools`.
+- `Direct` tools appear in the host's `tools/list` (`ServerMode::On`) **and** are declared inline in the `codemode` description — TypeScript, grouped by namespace, within pi's 3000-token budget using round-robin selection (every namespace is represented before any namespace is complete).
 - `Deferred` and `CodeModeOnly` tools never appear in `tools/list`; calling them natively answers with an instructive error directing the model to a script (the self-correction shape from Zed discussion [#64004](https://github.com/zed-industries/zed/discussions/64004)).
 - Inside the sandbox every tool is callable regardless of exposure.
-- `CodemodeMode::Only` (pi's `codemode.mode: "only"`, OpenCode 2.0's default) hides direct tools behind the codemode tool entirely.
+- `ServerMode::Only` (pi's `codemode.mode: "only"`, OpenCode 2.0's MCP default) hides direct tools behind the codemode tool entirely.
 
-Per-tool overrides after connecting:
+## Approval, pause, and replay
+
+Mark a tool `requiresApproval` (Cloudflare's annotation) and runs that reach it **pause**:
 
 ```rust,ignore
-aggregator.registry_mut().override_exposure("github.get_me", ToolExposure::Direct);
+let mut handle = engine.start(&script, &context).await?;
+while let Some(call) = handle.next_call.next().await {
+    if requires_approval(&call.name) {
+        let state = SuspendState::new(script, answered_so_far);
+        session.save(state);            // JSON-serializable — persist anywhere
+        return paused(call.name);       // the model sees { status: "paused", ... }
+    }
+    let outcome = (call.execute)(call.args).await?;
+    handle.deliveries.unbounded_send((call.id, Outcome::Deliver(outcome))).unwrap();
+}
 ```
 
-## Naming conventions
-
-Different hosts and model vendors spell tool paths differently. The sandbox tree is *built from* registry paths, so any spelling works end to end — a flat path is a single-segment leaf, a dotted path nests. Pick per upstream via `UpstreamConfig::naming`:
-
-| Convention | Path for (`github`, `create_issue`) | Sandbox shape | Matches |
-|---|---|---|---|
-| `Namespaced` *(default)* | `github.create_issue` | nested; `Object.keys(tools.github)` enumerates | OpenCode |
-| `McpPrefixed` | `mcp__github__create_issue` | flat, one segment | pi, Claude Code |
-| `Flat { separator }` | `github__create_issue` (with `__`) | flat, no prefix | Cloudflare-style flattening |
-| `Custom(mapping)` | whatever the closure returns | follows the path's shape | anything else |
-
-The sandbox behaves identically in all cases — `ALL_TOOLS`, `searchTools`, close-match suggestions, and routing (the upstream always sees its own tool name) are spelling-agnostic. What differs: only `Namespaced` keeps namespace enumeration, namespace-scoped search, and per-namespace inline declarations, which is why it is the default.
+The host answers every yielded call — allow, deny, or pause. Resuming replays the recorded outcomes (the recorded calls never re-execute) and continues the script; the state is `serde`-serializable, so persistence is the host's one-liner. `CodemodeServer::run_with_approval` wraps the whole flow: pause at the annotated tool, return `{ status: "paused", executionId, pending }`, and `resume(&execution_id)` continues after approval.
 
 ## Development
 
@@ -192,17 +181,14 @@ The workspace mirrors the [rust-sdk](https://github.com/modelcontextprotocol/rus
 ```
 just fmt      # nightly rustfmt
 just check    # clippy, deny warnings
-just test     # full suite (76 tests)
+just test     # full suite
 ```
 
 ### Test provenance
 
-The conformance suites port scenarios from two references:
+The tests are **contract tests**: each lifecycle clause in [`rmcp_codemode::engine`](crates/rmcp-codemode/src/engine.rs) (fresh VM, never-settling promise fails immediately, unawaited calls cancelled, deadline preemption, partial output surviving failure, `exit()` through a swallowed catch) has a test against the contract, plus catalog semantics (pi's round-robin budget, OpenCode's paging, alias resolution, the guard message), and an end-to-end approval pause/resume round trip over a real rmcp client.
 
-- **pi `sandbox.test.ts`:** JSON round trips, parallel `Promise.all` fan-out, tool failures as catchable JS errors, partial output kept on failure, the no-timers/no-fetch/no-process guarantee, deadline and memory limits, `ALL_TOOLS`, normalized identifiers, close-match suggestions, and the host-shaped `tools` object.
-- **OpenCode `tool-paths.test.ts`:** namespace enumeration (`Object.keys(tools.api)` lists child segments), non-callable namespaces, and blocked member names (`tools.issues.constructor`, `tools.prototype` resolve as real paths; `__proto__` poisoning stays inert).
-
-Deliberately not ported: OpenCode's `test262`/`parity`/`stdlib` suites (~500KB) test the ECMAScript conformance of their custom interpreter — QuickJS-NG ships its own conformance, which is why this crate embeds it. pi's worker/`close()` lifecycle and session-snapshot machinery are host-level concerns this crate exposes as extension points instead.
+Deliberately not ported: OpenCode's `test262`/`parity`/`stdlib` suites (~500KB) test the ECMAScript conformance of their custom interpreter — QuickJS-NG ships its own conformance, which is why this crate embeds it.
 
 ## Status
 
@@ -210,20 +196,10 @@ PoC, tracking [rust-sdk#1437](https://github.com/modelcontextprotocol/rust-sdk/i
 
 Known gaps:
 
-- One store per server (pi scopes stores per session/branch — a host with sessions would key persisters itself); `_meta` plumbing.
-- The aggregator reconnects upstreams only by rebuilding.
-
-Namespace metadata follows pi's `ToolNamespace`: each namespace carries a `description` (shown in listings and search), `instructions` (longer usage guidance — automatically pulled from each upstream server's own handshake `instructions` field, like pi's `connection.instructions`), and `aliases` (so `describeNamespace("docs")` finds `mcp__docs`).
-- Native-tool executor errors do not carry typed codes unless the tool encodes them in its return value.
-- Syntax-error messages carry no line numbers (QuickJS reports none; pi's Node runtime does).
-
-### Benchmarks (vs. pi / OpenCode)
-
-Planned: a shared scenario set (N sequential tool calls, M parallel tool calls, script startup, search over K tools) run against pi's Node sandbox for a comparison table. Structural advantages on the tool-call-heavy workload that dominates codemode wall time:
-
-- No WASM compile step at startup (pi compiles QuickJS-wasm per process); VM creation is native and sub-millisecond.
-- No worker-thread hop per tool call; tool calls resolve as native tokio futures, so `Promise.all` maps to concurrent tasks with no thread boundary.
-- Raw JS compute loses to V8/JSC — model-written scripts are orchestration, not benchmarking.
+- Namespace-scoped store domains (pi scopes stores per session/branch).
+- The snippet save/run API (`codemode.run("name")` — the store persists; the script-reuse surface is next).
+- Deterministic replay hardening (pi's virtual clock + seeded PRNG + fingerprint) — replay currently requires call results to be replayable, which holds for the recorded-outcome model but not for scripts that read wall-clock time.
+- `_meta` plumbing; upstream reconnection (currently rebuild-only).
 
 ## License
 

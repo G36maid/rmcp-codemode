@@ -90,6 +90,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "codemode-demo"
+version = "0.2.0"
+dependencies = [
+ "rmcp",
+ "rmcp-codemode",
+ "rmcp-codemode-quickjs",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
