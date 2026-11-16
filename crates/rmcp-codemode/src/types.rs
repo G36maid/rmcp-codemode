@@ -63,7 +63,7 @@ pub struct ToolError {
 
 /// One item of the script's output, in production order. (pi:
 /// `CodemodeOutputItem`.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputItem {
     /// `text()` or `console.*` (`console: true`).

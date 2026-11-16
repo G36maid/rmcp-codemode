@@ -1,0 +1,23 @@
+[package]
+name = "rmcp-codemode-quickjs"
+description = "QuickJS engine for rmcp-codemode: pi-exact sandbox lifecycle over rquickjs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+futures = "0.3"
+rmcp-codemode = { workspace = true }
+rquickjs = { version = "0.14", features = ["futures", "rust-alloc", "parallel"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+
+[lints]
+workspace = true
