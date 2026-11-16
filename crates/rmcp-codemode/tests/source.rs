@@ -1,0 +1,157 @@
+//! Oracle suite: pi's `packages/codemode/test/source.test.ts` ported
+//! mechanically (same inputs, same assertions). 5 cases, one describe.
+
+use rmcp_codemode::{CodemodeSourceError, SourceOptions, parse_codemode_source};
+
+/// pi: `returns plain code unchanged`
+#[test]
+fn returns_plain_code_unchanged() {
+    assert_eq!(
+        parse_codemode_source("text('hi')").unwrap(),
+        rmcp_codemode::ParsedSource {
+            code: "text('hi')".into(),
+            options: SourceOptions::default(),
+        }
+    );
+    assert_eq!(
+        parse_codemode_source("// just a comment\nreturn 1").unwrap(),
+        rmcp_codemode::ParsedSource {
+            code: "// just a comment\nreturn 1".into(),
+            options: SourceOptions::default(),
+        }
+    );
+}
+
+/// pi: `parses the options line and keeps line numbers`
+#[test]
+fn parses_the_options_line_and_keeps_line_numbers() {
+    assert_eq!(
+        parse_codemode_source("// @options: {\"timeout_ms\": 10}\nconst a = 1;\ntext(a)").unwrap(),
+        rmcp_codemode::ParsedSource {
+            code: "\nconst a = 1;\ntext(a)".into(),
+            options: SourceOptions {
+                max_output_tokens: None,
+                timeout_ms: Some(10),
+            },
+        }
+    );
+    assert_eq!(
+        parse_codemode_source(
+            "  // @options:{\"max_output_tokens\":0,\"timeout_ms\":1500}\r\ntext(1)"
+        )
+        .unwrap()
+        .options,
+        SourceOptions {
+            max_output_tokens: Some(0),
+            timeout_ms: Some(1500),
+        }
+    );
+    assert_eq!(
+        parse_codemode_source("// @options: {}\ntext(1)").unwrap(),
+        rmcp_codemode::ParsedSource {
+            code: "\ntext(1)".into(),
+            options: SourceOptions::default(),
+        }
+    );
+}
+
+/// pi: `only treats the first line as an options line`
+#[test]
+fn only_treats_the_first_line_as_an_options_line() {
+    assert_eq!(
+        parse_codemode_source("// @optionsx {}\ntext(1)")
+            .unwrap()
+            .options,
+        SourceOptions::default()
+    );
+    assert_eq!(
+        parse_codemode_source("text(\"// @options: {}\")")
+            .unwrap()
+            .options,
+        SourceOptions::default()
+    );
+}
+
+/// pi: `rejects an options line that is not the first line`
+/// (#10631: an options line after the first line used to be ignored, so its
+/// timeout never applied.)
+#[test]
+fn rejects_an_options_line_that_is_not_the_first_line() {
+    let cases: [(&str, usize); 4] = [
+        (
+            "// count things\n// @options: {\"timeout_ms\": 1000}\nwhile (true) {}",
+            2,
+        ),
+        (
+            "\n  // @options: {\"timeout_ms\": 1000}\nwhile (true) {}",
+            2,
+        ),
+        ("text(1)\r\n// @options: {\"timeout_ms\": 1}", 2),
+        (
+            "// @options: {\"timeout_ms\": 1}\ntext(1)\n// @options: {\"timeout_ms\": 2}",
+            3,
+        ),
+    ];
+    for (input, line) in cases {
+        let error = parse_codemode_source(input).unwrap_err();
+        assert!(error.0.contains(&format!(
+            "The // @options: line must be the first line of the input; found one on line {line}"
+        )),
+        "{input}: {error:?}");
+    }
+}
+
+/// pi: `rejects empty input and invalid options`
+#[test]
+fn rejects_empty_input_and_invalid_options() {
+    let cases: [(&str, &str); 10] = [
+        ("", "Expected JavaScript source text (non-empty)"),
+        ("  \n", "Expected JavaScript source text (non-empty)"),
+        (
+            "// @options:\ntext(1)",
+            "@options must be a JSON object with supported fields",
+        ),
+        (
+            "// @options: {timeout_ms: 1}\ntext(1)",
+            "@options must be valid JSON with supported fields",
+        ),
+        (
+            "// @options: [1]\ntext(1)",
+            "@options must be a JSON object with supported fields",
+        ),
+        (
+            "// @options: {\"yield\": 1}\ntext(1)",
+            "@options only supports `max_output_tokens` and `timeout_ms`; got `yield`",
+        ),
+        (
+            "// @options: {\"max_output_tokens\": 1.5}\ntext(1)",
+            "@options field `max_output_tokens` must be a non-negative safe integer",
+        ),
+        (
+            "// @options: {\"timeout_ms\": 0}\ntext(1)",
+            "@options field `timeout_ms` must be a positive integer",
+        ),
+        (
+            "// @options: {\"timeout_ms\": 1}",
+            "The @options line must be followed by JavaScript source on subsequent lines",
+        ),
+        (
+            "// @options: {\"timeout_ms\": 1}\n  \n",
+            "The @options line must be followed by JavaScript source on subsequent lines",
+        ),
+    ];
+    for (input, message) in cases {
+        let error = parse_codemode_source(input).unwrap_err();
+        assert!(error.0.contains(message), "{input}: {error:?}");
+    }
+}
+
+/// The error type is the ported `CodemodeSourceError` (pi: `toThrow(CodemodeSourceError)`).
+#[test]
+fn errors_are_codemode_source_errors() {
+    let error: CodemodeSourceError = parse_codemode_source("").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Expected JavaScript source text (non-empty). Provide JS only, optionally with a first line `// @options: {\"max_output_tokens\": 1000}`."
+    );
+}

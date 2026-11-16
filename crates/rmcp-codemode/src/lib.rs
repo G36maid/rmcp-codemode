@@ -10,6 +10,7 @@
 pub mod declarations;
 pub mod engine;
 pub mod naming;
+pub mod source;
 pub mod types;
 
 pub use declarations::{
@@ -17,6 +18,10 @@ pub use declarations::{
     render_tool_sample, render_tool_signature, resolve_schema_ref, schema_to_type,
 };
 pub use engine::{Engine, RunHandle};
+pub use source::{
+    CODEMODE_OPTIONS_PREFIX, CodemodeSourceError, ParsedSource, SourceOptions,
+    parse_codemode_source,
+};
 pub use types::{
     Call, CallStatus, CallTarget, DeclaredGlobal, DeclaredTool, DeliverError, During, ErrorKind,
     ExecuteOptions, HostCall, JsonSchema, Outcome, OutputItem, RunOptions, RunResult,
