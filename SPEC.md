@@ -262,7 +262,7 @@ heap {Budget.memory_limit}, budget {Budget.interrupt_budget ?? none}
 
 | Item | Status | Notes |
 |---|---|---|
-| `console` (total formatter: cycles → `[Circular]`, NaN/Infinity literal, never throws) | **KEEP** | pi/OC have console; codex removes it — rejected here. OC's total-formatting semantics adopted (contract-tested) |
+| `console` (pi formatter: JSON style, never throws, NaN/Infinity literal at the top level) | **KEEP — pi-style** | decision 2026-11-15: OC's DevTools-style total formatter (Map/Set/RegExp rich rendering, `[Circular]`, `[opaque reference]`) and `console.table`/`console.dir` are NOT adopted — the §6.1 "total formatter" note overstated the adoption; only never-throws + literal NaN/Infinity were ever shared with pi, and the engine already has both. OC's rich-formatting cases assert our pi-style output in `opencode_crosscheck.rs` with divergence labels |
 | `searchTools` / `describeTool` / `describeNamespace` | **KEEP — host layer** (OQ6 resolved) | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Registered by the router/server layer over the generic host-globals mechanism — NOT engine bindings (v1's placement dropped); the ServerHandler always wires them, so the MCP surface always has discovery; headless embedders opt in |
 | `notify()` (mid-run output injection) | **REJECT** | tied to the rejected cell lifecycle; MCP has no mid-call content streaming — `notifications/progress` carries tokens, not content items, so there is no transport to ride |
 | `setTimeout` / `clearTimeout` | **REJECT** | pi/OC sandboxes have no script-facing timers; real-time timers break determinism (D11); virtual-clock timers are no-ops — virtual time advances only on delivered results, so timing is expressed by awaited calls |
@@ -494,6 +494,18 @@ The OC-adopted behaviors (counted `searchTools`, total console formatting,
 tool-path probes: `prototype`/`__proto__`/poisoning/bracket names, close-match
 guard) get the same treatment from OC's four test files
 (`codemode/errors/limits/tool-paths.test.ts`): mechanical ports, labeled.
+
+Status (2026-11-15, clone = `anomalyco/opencode` main post-#62642): the
+applicable subset is ported in `opencode_crosscheck.rs` — 10 green (console
+pi-style pins with OC divergence labels, tool-path probes on the frozen
+null-prototype tools object, prototype-pollution confinement, error-identity
+semantics, deadline-stops-runaway cross-check). N/A by design: OC's dotted
+tool namespaces and `tools.search` alias (D4 keeps pi's flat naming),
+stale-signature hints (pi surfaces plain tool errors), OC's VM-internal
+caps (D10 keeps pi budgets), `Function`-constructor blocking (pi cages it
+but leaves it working). Console formatter: pi-style kept, OC rich formatting
+and `table`/`dir` not adopted (§6.2 decision). Counted-`searchTools` cases
+defer to §10 (the discovery surface is server-layer, OQ6).
 
 ### 11.4 Status of v1's tests
 
