@@ -51,9 +51,9 @@ impl VirtualClock {
     }
 }
 
-/// mulberry32: a small, fast PRNG; one 32-bit draw per call. (pi:
-/// `runtime/vm.ts:83-96`; pinned expectations live in the ported
-/// deterministic tests.)
+/// mulberry32: a small, fast PRNG; one 32-bit draw per call. Ported
+/// line-for-line from pi's `prng` (`runtime/vm.ts:83-96`) so draw sequences
+/// match the oracle.
 #[derive(Debug)]
 pub struct Mulberry32 {
     state: Mutex<u32>,
@@ -69,16 +69,16 @@ impl Mulberry32 {
     /// Returns a f64 in `[0, 1)`, identical to pi's draw sequence.
     pub fn next_f64(&self) -> f64 {
         let mut state = self.state.lock().unwrap();
-        let mut t = *state;
-        t = t.wrapping_add(0x6D2B79F5);
-        *state = t;
-        t = t.wrapping_mul(t);
-        t ^= t >> 13;
-        t = t.wrapping_mul(0x6D2B79F5);
-        t ^= t >> 16;
-        // pi: `(t >>> 0) / 4294967296` — t is already u32, so the shift is a
-        // no-op; clippy flags it, hence the allow-free simplification.
-        t as f64 / 4294967296.0
+        // state = (state + 0x6d2b79f5) >>> 0
+        *state = state.wrapping_add(0x6d2b_79f5);
+        let s = *state;
+        // value = imul(state ^ (state >>> 15), 1 | state)
+        let mut value = (s ^ (s >> 15)).wrapping_mul(1 | s);
+        // value = (value + imul(value ^ (value >>> 7), 61 | value)) ^ value
+        value = (value.wrapping_add((value ^ (value >> 7)).wrapping_mul(61 | value))) ^ value;
+        // return (value ^ (value >>> 14)) >>> 0
+        let draw = value ^ (value >> 14);
+        draw as f64 / 4294967296.0
     }
 }
 
