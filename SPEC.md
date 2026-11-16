@@ -234,18 +234,47 @@ system-prompt `mcp_servers` section, which hosts already re-render per prompt.
 
 ## 8. Naming & upstream ingestion
 
-- Canonical tool name: `mcp__<server>__<tool>` (D4), one flat segment in the
-  Space, so `tools.mcp__github__list_issues` is a plain property read.
-  Prefix-level access (`tools["mcp__github__" + name]`) must resolve as the
-  namespace (pi `tool.ts:413-414`).
-- Normalization rules for server/tool names that are not valid JS identifiers
-  (pi and codex both normalize; exact tables differ) — **OQ4**, plus the
-  collision policy for normalized names.
+### 8.1 Canonical names & normalization (RESOLVED, OQ4 — pi `docs/mcp.md:77`)
+
+Two layers, both pi-exact (the MCP layer is stricter and pre-empts the engine
+layer):
+
+- **Server names** (config validation): only letters, digits, `_`, `-`. Names
+  differing only in `-` vs `_` are **the same server** — a second registration
+  is rejected; a `mcp.json` entry overrides an extension-registered one.
+- **Tool names**: `mcp__<server>__<tool>`, every character outside letters,
+  digits, and `_` replaced by `_`. Tools of one server whose names then
+  collide **all get a hash suffix** (not silent overwrite).
+- Engine-layer fallback for native tools remains pi's
+  `toCodemodeIdentifier` (`identifier.ts:5-12`: first `[A-Za-z_$]`, rest
+  `[A-Za-z0-9_$]`, other → `_`, empty → `_`) with dual-key exposure
+  (`prelude-source.ts:216-224`: `tools[jsName]` always; canonical alias only
+  if free) and dual-spelling resolution (`execute.ts:659-661,706`). For MCP
+  tools the stricter layer above means these fallbacks rarely fire.
+- Namespace acceptance is four-spelled (pi `docs/mcp.md:204`):
+  `describeNamespace()` and `searchTools({namespace})` accept
+  `mcp__dev-radius`, `mcp__dev_radius`, `dev-radius`, `dev_radius`.
+  Locked by the ported `sandbox.test.ts > tools > exposes tools under
+  normalized identifiers` case.
+
+### 8.2 Ingestion
+
 - Ingestion reuses v1's `space_from_peer` / `upstream_into_space`: handshake
   `instructions` auto-attached, unwrap order (structuredContent → first text
   block JSON → raw text), `isError` → `Err` carrying text.
-- Upstream lifecycle API (library level): connect/reconnect with backoff, health,
-  tool refresh, per-server enable/disable — **OQ7**.
+
+### 8.3 Upstream lifecycle (pi policy verified, `docs/mcp.md:100` — OQ7 largely resolved)
+
+- Background connect for every enabled server; tools appear on connect; the
+  codemode description does not list them, so it does not change when servers
+  connect.
+- The first prompt waits up to **10 s** only for servers with `direct` tools;
+  others are waited for **on demand**: a codemode script waits for the servers
+  it names (`mcp__<server>`), and `searchTools()` / `ALL_TOOLS` waits for all.
+- HTTP network errors and transient statuses (408, 429, 5xx) retry **twice**;
+  a dropped connection reconnects on the next call.
+- A changed tool list: new tools added, withdrawn tools become unreachable.
+- Library API shape (Rust-side) is the remaining sliver of OQ7.
 
 ## 9. Native tools (embedder's right)
 
@@ -346,9 +375,9 @@ formatting) carry over — as reference, not as authority.
 | OQ1 | ~~v1 disposition~~ **RESOLVED** | **clean rewrite from this spec**, oracle-first: the ported pi suite (§11.1) is written before the engine that must pass it. v1 stays on main as reference material (QuickJS workarounds, verified fixes) until v2 passes the ported oracle suite, then archived; v1's hand-written tests are not ported (§11.4) |
 | OQ2 | ~~Crate split~~ **RESOLVED** | keep v1's two crates (core contracts / quickjs engine + server handler); revisit only if the server layer grows worth independent release |
 | OQ3 | ~~Deferred listing policy~~ **RESOLVED — pi-exact** | upstream MCP tools never listed in the description (default `codemode` exposure); server list = system-prompt `mcp_servers` section (≤4,096 chars, ≤250/server), re-rendered per prompt, appended on change; discovery via `searchTools` + `describeNamespace`; codemode tool never redeclared for upstream changes; per-server exposure config `direct/codemode/deferred/hidden` (§7.1) |
-| OQ4 | Name normalization | charset rules for server/tool names → JS identifiers; normalized-name collision policy |
+| OQ4 | ~~Name normalization~~ **RESOLVED — pi-exact, two layers** | server names: config-valid `[letters/digits/_/-]`, `-`≈`_` equivalence (same server, second rejected); tool names: non-alnum → `_`, colliding tools get hash suffixes (`docs/mcp.md:77`); engine-layer identifier fallback unchanged; four-spelling namespace acceptance (`:204`) (§8.1) |
 | OQ5 | Fingerprint composition | which hashes/versions enter the string; where it lives in `SuspendState` |
 | OQ6 | searchTools layer placement | bindings layer (v1) vs host/extension layer (pi's split) |
-| OQ7 | Upstream lifecycle API | reconnect/backoff shape, refresh triggers, enable/disable |
+| OQ7 | Upstream lifecycle API | **policy resolved** (pi `docs/mcp.md:100`: background connect, 10 s direct-wait, on-demand waits, retry 408/429/5xx ×2, reconnect on next call, tool-list change = add/unreachable — §8.3); remaining: Rust API shape |
 | OQ8 | codex-only globals | `notify()`, `setTimeout`, `generatedImage` adopt or reject |
 | OQ9 | In-flight call limiter | adopt pi's second limiter layer; default limit |
