@@ -43,8 +43,78 @@ pub struct QuickJsEngine {
     sandbox: SandboxOptions,
 }
 
+/// Names a global may not use: the built-in globals (pi: "must not shadow
+/// the built-in globals: `tools`, `ALL_TOOLS`, `console`, `text`, `image`,
+/// `exit`, `store`, `load`") and the built-in namespace prefixes
+/// (pi rejects `tools.x`, `store.x`).
+const RESERVED_GLOBALS: [&str; 8] = [
+    "tools",
+    "ALL_TOOLS",
+    "console",
+    "text",
+    "image",
+    "exit",
+    "store",
+    "load",
+];
+const RESERVED_NAMESPACES: [&str; 8] = [
+    "tools",
+    "ALL_TOOLS",
+    "console",
+    "text",
+    "image",
+    "exit",
+    "store",
+    "load",
+];
+
+/// A valid global name: an identifier, or `<namespace>.<member>` with one dot
+/// and valid identifier parts (pi: `a.b.c`, `a.`, `.a`, `a.not-valid` are
+/// all rejected).
+fn validate_global_name(name: &str) -> Result<(), String> {
+    let valid_ident = |s: &str| {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    match name.split_once('.') {
+        None => {
+            if valid_ident(name) {
+                Ok(())
+            } else {
+                Err(format!("Invalid global name \"{name}\""))
+            }
+        }
+        Some((namespace, member)) => {
+            if !valid_ident(namespace)
+                || !valid_ident(member)
+                || RESERVED_NAMESPACES.contains(&namespace)
+            {
+                Err(format!("Invalid global name \"{name}\""))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 impl QuickJsEngine {
+    /// Validates globals (pi throws at construction for invalid or reserved
+    /// names: `newSandbox({globals: [{name: "store", ...}]})` throws
+    /// /Invalid global/).
+    ///
+    /// # Panics
+    /// Panics on an invalid or reserved global name — a construction-time
+    /// configuration error, mirroring pi's throw.
     pub fn new(sandbox: SandboxOptions) -> Self {
+        for global in &sandbox.globals {
+            if let Err(message) = validate_global_name(&global.name) {
+                panic!("{message}");
+            }
+            if RESERVED_GLOBALS.contains(&global.name.as_str()) {
+                panic!("Invalid global name \"{}\"", global.name);
+            }
+        }
         Self { sandbox }
     }
 }
@@ -176,9 +246,14 @@ impl Shared {
                                 delete.push(k.to_owned());
                             }
                         }
-                        Some([key, value]) => {
-                            if let Some(k) = key.as_str() {
-                                set.insert(k.to_owned(), value.clone());
+                        Some([key, json_text]) if json_text.is_string() => {
+                            // The write crosses as JSON TEXT; parse it into
+                            // the typed write.
+                            if let Some(k) = key.as_str()
+                                && let Ok(parsed) =
+                                    serde_json::from_str::<Value>(json_text.as_str().unwrap())
+                            {
+                                set.insert(k.to_owned(), parsed);
                             }
                         }
                         _ => {}
@@ -374,7 +449,12 @@ fn register_bridge<'js>(
                             );
                             tokio::spawn(async move {
                                 let result = fut.await;
-                                let status = if result.is_ok() {
+                                // A call that settles after the script ended is
+                                // cancelled, whatever its outcome (pi: "aborts
+                                // unawaited calls when the script returns").
+                                let status = if shared2.finished.load(Ordering::Relaxed) {
+                                    CallStatus::Cancelled
+                                } else if result.is_ok() {
                                     CallStatus::Ok
                                 } else {
                                     CallStatus::Error
@@ -454,7 +534,8 @@ async fn run_execute(
         declarations.push(json!({
             "name": tool.name,
             "jsName": js_name,
-            "description": tool.description,
+            // pi's toolsJson defaults the description to "".
+            "description": tool.description.clone().unwrap_or_default(),
         }));
     }
     let mut globals_by_name: HashMap<String, Tool> = HashMap::new();
@@ -525,7 +606,14 @@ async fn run_execute(
                     .map_err(|e| format!("prelude failed: {e}"))?;
                 let tools_json = json!(declarations).to_string();
                 let globals_json = json!(global_declarations).to_string();
-                let store_json = json!(options.store).to_string();
+                // pi: storeJson is a snapshot of JSON TEXT — each value crosses as
+            // its JSON encoding, and the prelude parses on `load`.
+            let store_text: BTreeMap<&String, String> = options
+                .store
+                .iter()
+                .map(|(k, v)| (k, serde_json::to_string(v).unwrap_or_else(|_| "null".into())))
+                .collect();
+            let store_json = json!(store_text).to_string();
                 let api_obj: rquickjs::Object = prelude_fn
                     .call((bridge, tools_json, globals_json, store_json))
                     .map_err(|e| format!("prelude init failed: {e}"))?;
