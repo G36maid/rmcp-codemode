@@ -5,6 +5,7 @@ resolver = "3"
 [workspace.dependencies]
 rmcp-codemode = { version = "0.2.0", path = "./crates/rmcp-codemode" }
 rmcp-codemode-quickjs = { version = "0.2.0", path = "./crates/rmcp-codemode-quickjs" }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [workspace.package]
 edition = "2024"

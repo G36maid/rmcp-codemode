@@ -9,6 +9,7 @@
 
 pub mod declarations;
 pub mod engine;
+pub mod mcp;
 pub mod naming;
 pub mod source;
 pub mod types;
