@@ -214,10 +214,14 @@ heap {Budget.memory_limit}, budget none
 |---|---|---|
 | `console` (total formatter: cycles → `[Circular]`, NaN/Infinity literal, never throws) | **KEEP** | pi/OC have console; codex removes it — rejected here. OC's total-formatting semantics adopted (contract-tested) |
 | `searchTools` / `describeTool` / `describeNamespace` | **KEEP — host layer** (OQ6 resolved) | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Registered by the router/server layer over the generic host-globals mechanism — NOT engine bindings (v1's placement dropped); the ServerHandler always wires them, so the MCP surface always has discovery; headless embedders opt in |
-| `notify()` (mid-run output injection) | **OQ8** | codex-only; MCP has no mid-call partial results today |
-| `setTimeout` / `clearTimeout` | **OQ8** | codex-only; pending timeouts must not keep the run alive |
+| `notify()` (mid-run output injection) | **REJECT** | tied to the rejected cell lifecycle; MCP has no mid-call content streaming — `notifications/progress` carries tokens, not content items, so there is no transport to ride |
+| `setTimeout` / `clearTimeout` | **REJECT** | pi/OC sandboxes have no script-facing timers; real-time timers break determinism (D11); virtual-clock timers are no-ops — virtual time advances only on delivered results, so timing is expressed by awaited calls |
 | `yield_control()` / cell primitives | **OUT** | tied to the cell lifecycle (§2 schism); rejected for v2 |
-| `generatedImage(...)` | **OQ8** | codex-only; possibly covered by `image()` |
+| `generatedImage(...)` | **REJECT** | codex provider semantics; MCP generated images are plain image content blocks — `image(result.content[0])` already covers them |
+
+Principle: the script surface is **pi's surface + adopted OC behaviors**
+(counted search, total console). Codex-only globals are rejected unless they
+map onto our MCP transport — none of the three do.
 
 ## 7. Tool catalog & description
 
@@ -476,5 +480,5 @@ formatting) carry over — as reference, not as authority.
 | OQ5 | ~~Fingerprint composition~~ **RESOLVED — pi-exact** | pi's exact slot list: engine versions + FNV-1a prelude hash + `DETERMINISTIC_VERSION` (pinned-value-test discipline) + stack/heap from `Budget` (`max_stack_size` knob added) + `budget none`; enforced in `resume()` via `SuspendState` (§5.5) |
 | OQ6 | ~~searchTools layer placement~~ **RESOLVED — pi-exact (B)** | engine provides only the generic host-globals mechanism (grouping/spreading/numbering); searchTools/describeTool/describeNamespace are router-layer registrations over the Space index; engine core keeps only `ALL_TOOLS` (§6.1, §6.2) |
 | OQ7 | Upstream lifecycle API | **policy resolved** (pi `docs/mcp.md:100`: background connect, 10 s direct-wait, on-demand waits, retry 408/429/5xx ×2, reconnect on next call, tool-list change = add/unreachable — §8.3); remaining: Rust API shape |
-| OQ8 | codex-only globals | `notify()`, `setTimeout`, `generatedImage` adopt or reject |
+| OQ8 | ~~codex-only globals~~ **RESOLVED — all three rejected** | `notify()` (no transport, tied to rejected lifecycle), `setTimeout` (breaks determinism / no-op on virtual clock), `generatedImage` (subsumed by `image()`); principle: script surface = pi + adopted OC behaviors (§6.2) |
 | OQ9 | In-flight call limiter | adopt pi's second limiter layer; default limit |
