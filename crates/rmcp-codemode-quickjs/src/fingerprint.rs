@@ -23,20 +23,24 @@ pub const ENGINE_VERSION: &str = "rquickjs/0.14";
 /// deep-recursion test expects > 1000). Enters the fingerprint (§5.5).
 pub const MAX_STACK_SIZE: usize = 4 * 1024 * 1024;
 
-/// The fingerprint string, pi's slot list mapped to our stack. `budget` is
-/// always `none`: deadline preemption uses the interrupt handler without
-/// counting polls (pi's in-thread backend behaves the same,
-/// `deterministic.test.ts:207`).
-pub fn fingerprint(memory_limit_bytes: Option<u64>) -> String {
+/// The fingerprint string, pi's slot list mapped to our stack. The `budget`
+/// slot reflects the sandbox's poll budget — `budget ${interruptBudget ??
+/// "none"}` (pi `vm.ts:315-318`); pi's `deterministic.test.ts:207` expects
+/// `budget none` because that run set no budget.
+pub fn fingerprint(memory_limit_bytes: Option<u64>, interrupt_budget: Option<u64>) -> String {
     let heap = memory_limit_bytes
         .map(|bytes| bytes.to_string())
         .unwrap_or_else(|| "none".to_owned());
+    let budget = interrupt_budget
+        .map(|polls| polls.to_string())
+        .unwrap_or_else(|| "none".to_owned());
     format!(
-        "engine {}, prelude {}, deterministic {}, stack {}, heap {}, budget none",
+        "engine {}, prelude {}, deterministic {}, stack {}, heap {}, budget {}",
         ENGINE_VERSION,
         fnv1a(PRELUDE_SOURCE),
         DETERMINISTIC_VERSION,
         MAX_STACK_SIZE,
         heap,
+        budget,
     )
 }

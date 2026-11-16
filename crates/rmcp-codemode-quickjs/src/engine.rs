@@ -780,7 +780,10 @@ async fn run_vm(
             let setup: Result<rquickjs::Promise, String> = (|| {
                 // Fingerprint precedes any call (§5.5).
                 if let Some(on_started) = shared.on_started.lock().unwrap().as_ref() {
-                    on_started(fingerprint(sandbox.memory_limit_bytes));
+                    on_started(fingerprint(
+                        sandbox.memory_limit_bytes,
+                        sandbox.interrupt_budget,
+                    ));
                 }
                 // The determinism shim: virtual clock Date/performance, seeded
                 // Math.random, no WeakRef/FinalizationRegistry, UTC-forced

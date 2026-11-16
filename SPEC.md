@@ -145,11 +145,18 @@ Four locked decisions from the `types.ts` full read:
 
 - **Fresh VM per run.** A run gets a new QuickJS VM; the VM is disposed when the
   run settles, times out, or is aborted (D3).
-- Preemption via interrupt handler at the deadline; a never-settling tool promise
-  fails the run immediately; unawaited calls are cancelled.
-- **Worker pool** (run-level): default 2 slots, arrival order, admission failure
-  *before* the VM starts, wait counted against the deadline, pi's exact admission
-  failure message. Worker-pool wait and deadline interact as `min(deadline, wait)`.
+- Preemption via interrupt handler at the deadline and by the sandbox's poll
+  budget (§5.2 `interrupt_budget`); a script waiting on nothing that can resume
+  it (no pending call, no timers — the prelude's `stalled()`, pi
+  `vm.ts:243-250`) fails immediately; a **pending** tool call never stalls the
+  run — a hanging tool waits until the deadline or abort, like pi.
+  Unawaited calls are cancelled.
+- **Run admission is the embedder's** (D2/D14): pi's worker pool
+  (`PI_CODEMODE_MAX_WORKERS`, `CODEMODE_WORKER_WAIT_MS = 60_000`,
+  `execute.ts:60-69,557-567`) is a coding-agent host feature — a process-wide
+  admission gate across sessions — not engine surface. The engine runs each
+  `execute` on its own VM; a router limiting concurrent runs may mirror pi's
+  admission message at the server layer (§10).
 - **No in-flight call limiter** (RESOLVED, OQ9 — pi-exact): nested calls are
   unlimited within a run, bounded only by `max_tool_calls` and the deadline —
   pi's engine has no concurrency cap on nested calls either (the prelude
@@ -167,14 +174,17 @@ Four locked decisions from the `types.ts` full read:
 | Budget | Default | Notes |
 |---|---|---|
 | `timeout_ms` | host decides (None = none) | script `@options.timeout_ms` may tighten |
-| `max_output_tokens` | 10,000 (4 chars/token estimate) | pi `execute.ts:306-307` |
+| `interrupt_budget` | sandbox-level; None = none (pi `InlineSandboxOptions.interruptBudget`, inline default 100_000; the deterministic worker path defaults to none) | interrupt-handler poll count, never reset, accumulates across tool waits (§5.1); enters the fingerprint (§5.5) |
+| `max_output_tokens` | 10,000 (4 chars/token estimate) | **host-side** in pi (`execute.ts:306-307`) — server-layer (§10), not engine |
 | `max_output_items` | 100,000 | |
 | `max_output_chars` | 16 MiB | |
 | `max_tool_calls` | 500 | counted calls include `searchTools` (OC semantics) |
 | `default_search_limit` | 8 (pi's; OC's is 10) | script's explicit `limit` wins |
 | `memory_limit` | 256 MiB | pi's heap cap |
 | `max_stack_size` | 512 KiB | pi's default (`vm.ts:55-58`); enters the fingerprint (§5.5) |
-| `max_workers` / `worker_wait_ms` | 2 / 60,000 ms | pi's process-wide worker story |
+
+Worker-pool knobs (`max_workers` / `worker_wait_ms`) are the **embedder's**
+admission gate, not a sandbox budget — see §5.1.
 
 ### 5.3 Suspension & replay (capability, not wire)
 
@@ -202,7 +212,7 @@ Composition is pi's exact slot list (`vm.ts:319`), mapped to our stack:
 ```
 rquickjs {version}, quickjs {libqjs version}, prelude {fnv1a-8hex(prelude source)},
 deterministic {DETERMINISTIC_VERSION}, stack {Budget.max_stack_size},
-heap {Budget.memory_limit}, budget none
+heap {Budget.memory_limit}, budget {Budget.interrupt_budget ?? none}
 ```
 
 - **prelude hash**: FNV-1a 32-bit (`0x811c9dc5` offset, `0x01000193` prime),
@@ -214,9 +224,9 @@ heap {Budget.memory_limit}, budget none
   pi (`deterministic.test.ts:132`: *"a change here changes what replayed
   scripts see, so it must change the fingerprint too"*;
   `PINNED_FIRST_RANDOM`/`PINNED_SEED_ZERO`).
-- **`budget none`**: our deadline preemption uses the rquickjs interrupt
-  handler without counting polls — same as pi's in-thread backend
-  (`deterministic.test.ts:207` expects `budget none` there).
+- **`budget {interrupt_budget ?? none}`**: the slot mirrors the sandbox's poll
+  budget (pi `vm.ts:315-318` — `budget ${options.interruptBudget ?? "none"}`);
+  `deterministic.test.ts:207` expects `budget none` because that run set none.
 - **Enforcement**: the fingerprint travels in `SuspendState`; `resume()`
   refuses a mismatch (stronger than pi, which only reports to the host).
 - Output/tool-call limits are deliberately **not** in the fingerprint — pi
