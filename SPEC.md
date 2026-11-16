@@ -66,13 +66,14 @@ Key reads that shaped decisions:
 | D2 | Form | **crate only**, no binary; transports are the embedder's concern | LOCKED | design review 2026-11 |
 | D3 | Execution lifecycle | **pi model**: fresh QuickJS VM per run; suspension/replay as engine capability | LOCKED | pi `runtime/worker.ts:2` *"one worker runs one script inside a fresh QuickJS VM"*; `execution.ts:21` (interrupt + dispose) |
 | D4 | Tool naming | **`mcp__<server>__<tool>`**, flat | LOCKED | pi `core/mcp-servers.ts:47-49`; codex exec description (`tools.mcp__ologs__get_profile`) |
-| D5 | Approval over MCP wire | **not in v2** — runs execute directly within budgets; engine keeps `SuspendingEngine` for embedders and a future wire design (elicitation is the likely vehicle) | LOCKED | design review 2026-11 |
+| D5 | Approval over MCP wire | **not in v2** — runs execute directly within budgets; engine keeps `SuspendingEngine` for embedders and a future wire design. **The standard vehicle is the MCP Tasks extension** (SEP-1686 → SEP-2663 Final): a run needing approval = task in `input_required` with the elicitation in `inputRequests`, answered via `inputResponses`; long-running scripts = task-augmented `tools/call` with `tasks/get` polling (rmcp 3.9 ships `task_manager.rs`). v1's bespoke `{status:"paused", executionId}` wire shape is superseded by this for any future wire work | LOCKED | spec 2025-11-25 `basic/utilities/tasks`; SEP-2663 (Final 2026-04) |
 | D6 | Native tools | **embedder's right**: the crate accepts native tools into the Space; the crate itself ships none | LOCKED | pi `tool.ts:164-166` (`getCodemodeCallableTools` = all session tools minus codemode itself); CC `$`/`edit()` |
 | D7 | Script surface | **convergent intersection is core**; per-implementation extras are opt-in profile items (§6.2) | LOCKED (core) | §2 convergent core list |
 | D8 | Conformance testing | **pi's own test suite, ported mechanically, is the conformance instrument** (same scripts, fixtures, assertions; each test labeled with its pi source); real-MCP fixtures on the ingestion axis; mocks only for engine-internal units | LOCKED | v1's hand-written tests verify the porter's *impression* of pi, not pi — rejected in review; the ported suite is the oracle |
 | D9 | Tool description | catalog lives in the **codemode tool description** (not system prompt): TS declarations grouped by namespace, budgeted, deferred-aware | LOCKED | pi `tool.ts:229-272`; §7 |
 | D10 | Budget constants | pi-aligned (§5.2) | LOCKED | pi `execute.ts:52,306-307`; v1 `Budget::default()` matches |
 | D11 | Determinism | virtual clock (advances only on delivered outcomes, never backward) + seeded mulberry32; WeakRef/FinalizationRegistry removed | LOCKED | pi `vm.ts:83-103`; `protocol.ts:24` |
+| D12 | MCP protocol baseline | spec **2025-11-25** + the Final SEPs we rely on (§10.1); `_meta` keys use reverse-DNS prefix `io.github.g36maid/` (v1's `codemode/storeDomain` violates the SHOULD and is renamed); tool naming complies with SEP-986; Tasks extension tracked as the future wire vehicle (D5) | LOCKED | verified against modelcontextprotocol.io 2026-11 |
 
 ## 4. Architecture — crate layering
 
@@ -294,6 +295,34 @@ layer):
   embedder-level pause/resume API (§5.3).
 - Transports are the embedder's (D2). The component is transport-agnostic; the
   demo's in-process wiring remains the reference.
+
+### 10.1 MCP protocol baseline (D12 — verified 2026-11)
+
+- **Baseline**: spec `2025-11-25` plus the Final SEPs this design relies on.
+  Draft-only features are tracked, not adopted.
+- **Tool names (SEP-986, Final)**: SHOULD 1–64 chars, case-sensitive, charset
+  `[A-Za-z0-9_./-]`. Our `mcp__<server>__<tool>` (D4) complies; the `mcp__`
+  prefix is a host convention the spec does not govern. Because the spec
+  allows `.` and `/` in upstream tool names (e.g. `user-profile/update`),
+  normalization (§8.1) is load-bearing, not hypothetical.
+- **`_meta` key grammar** (spec "General fields", 2025-06-18 → current):
+  optional reverse-DNS prefix + name; second label `modelcontextprotocol` or
+  `mcp` is reserved. Store-domain selection moves from v1's
+  `codemode/storeDomain` to **`io.github.g36maid/storeDomain`** (v1's key
+  violates the reverse-DNS SHOULD). SEP-1319 is cited only for what it is —
+  the structural decoupling that guarantees `_meta` on every request — not as
+  the source of `_meta` semantics.
+- **Elicitation**: client capabilities `elicitation: {form, url}`; SEP-1036
+  (URL mode) and SEP-1330 (enum schema) are Final. Used by embedders and by
+  the future Tasks-based approval flow (D5), not by v2 wire behavior.
+- **Tasks**: experimental in 2025-11-25 (SEP-1686), now the
+  `io.modelcontextprotocol/tasks` extension (SEP-2663, Final). Not adopted in
+  v2 (D5); the codemode tool MAY declare `execution.taskSupport: "forbidden"`
+  in v2 so hosts know polling is not available yet.
+- **Tracked, not adopted**: draft per-request protocol fields
+  (`io.modelcontextprotocol/protocolVersion` etc.), SEP-2567 sessionless
+  handles, SEP-2575 stateless guidance, SEP-2577 (deprecating roots,
+  sampling, logging — relevant to which upstream capabilities we forward).
 
 ## 11. Conformance & testing
 
