@@ -194,6 +194,17 @@ heap {Budget.memory_limit}, budget none
   writes buffer, commit only on success (pi split; v1 semantics kept).
   Store domains via `_meta["codemode/storeDomain"]` (SEP-1319) kept.
 - `ALL_TOOLS` metadata (`{ name, description }`).
+- **Host-registered globals** (pi's generic mechanism, `prelude-source.ts:262`):
+  the engine accepts named globals from the host with namespace grouping,
+  argument spreading on request, sync globals not recorded as calls, and
+  async host-answered globals **numbered as calls** (pi
+  `deterministic.test.ts:209`, sandbox tests for grouping/spreading). This
+  mechanism is how discovery surfaces are wired (OQ6): the host/router layer
+  registers `searchTools` / `describeTool` / `describeNamespace` over the
+  Space's search index — the engine core itself only knows `ALL_TOOLS`
+  (pi `prelude-source.ts:254`). Because async globals are numbered calls,
+  OC's counted-search semantics fall out of the uniform call budget
+  automatically.
 - Budgets per §5.2 enforced inside the sandbox; over-budget emits the pi-style
   error strings.
 
@@ -202,7 +213,7 @@ heap {Budget.memory_limit}, budget none
 | Item | Status | Notes |
 |---|---|---|
 | `console` (total formatter: cycles → `[Circular]`, NaN/Infinity literal, never throws) | **KEEP** | pi/OC have console; codex removes it — rejected here. OC's total-formatting semantics adopted (contract-tested) |
-| `searchTools` / `describeTool` / `describeNamespace` | **KEEP** | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Layer placement: **OQ6** (pi has these at the host-extension layer, not engine core) |
+| `searchTools` / `describeTool` / `describeNamespace` | **KEEP — host layer** (OQ6 resolved) | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Registered by the router/server layer over the generic host-globals mechanism — NOT engine bindings (v1's placement dropped); the ServerHandler always wires them, so the MCP surface always has discovery; headless embedders opt in |
 | `notify()` (mid-run output injection) | **OQ8** | codex-only; MCP has no mid-call partial results today |
 | `setTimeout` / `clearTimeout` | **OQ8** | codex-only; pending timeouts must not keep the run alive |
 | `yield_control()` / cell primitives | **OUT** | tied to the cell lifecycle (§2 schism); rejected for v2 |
@@ -463,7 +474,7 @@ formatting) carry over — as reference, not as authority.
 | OQ3 | ~~Deferred listing policy~~ **RESOLVED — pi-exact** | upstream MCP tools never listed in the description (default `codemode` exposure); server list = system-prompt `mcp_servers` section (≤4,096 chars, ≤250/server), re-rendered per prompt, appended on change; discovery via `searchTools` + `describeNamespace`; codemode tool never redeclared for upstream changes; per-server exposure config `direct/codemode/deferred/hidden` (§7.1) |
 | OQ4 | ~~Name normalization~~ **RESOLVED — pi-exact, two layers** | server names: config-valid `[letters/digits/_/-]`, `-`≈`_` equivalence (same server, second rejected); tool names: non-alnum → `_`, colliding tools get hash suffixes (`docs/mcp.md:77`); engine-layer identifier fallback unchanged; four-spelling namespace acceptance (`:204`) (§8.1) |
 | OQ5 | ~~Fingerprint composition~~ **RESOLVED — pi-exact** | pi's exact slot list: engine versions + FNV-1a prelude hash + `DETERMINISTIC_VERSION` (pinned-value-test discipline) + stack/heap from `Budget` (`max_stack_size` knob added) + `budget none`; enforced in `resume()` via `SuspendState` (§5.5) |
-| OQ6 | searchTools layer placement | bindings layer (v1) vs host/extension layer (pi's split) |
+| OQ6 | ~~searchTools layer placement~~ **RESOLVED — pi-exact (B)** | engine provides only the generic host-globals mechanism (grouping/spreading/numbering); searchTools/describeTool/describeNamespace are router-layer registrations over the Space index; engine core keeps only `ALL_TOOLS` (§6.1, §6.2) |
 | OQ7 | Upstream lifecycle API | **policy resolved** (pi `docs/mcp.md:100`: background connect, 10 s direct-wait, on-demand waits, retry 408/429/5xx ×2, reconnect on next call, tool-list change = add/unreachable — §8.3); remaining: Rust API shape |
 | OQ8 | codex-only globals | `notify()`, `setTimeout`, `generatedImage` adopt or reject |
 | OQ9 | In-flight call limiter | adopt pi's second limiter layer; default limit |
