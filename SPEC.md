@@ -320,7 +320,9 @@ tools:
    entry point pi-exact, reversing the earlier §6.2 no-separate-tool_search
    framing; deferred tools' declarations stay out of the codemode
    description's budgeted listing via its `deferred` parameter,
-   `tool.ts:389-395`), `hidden`.
+   `tool.ts:389-395`), `hidden`. Scope note for §10: pi's `isSearchable`
+   (`tool-search/tool.ts:292-294`) lets `tool_search` load **codemode- and
+   deferred-exposure** tools — direct and hidden are not searchable.
 
 Consequence for the router: no byte-stability requirement on the codemode
 description (upstream changes never touch it); the only dynamic surface is the
