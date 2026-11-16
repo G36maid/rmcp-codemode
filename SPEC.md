@@ -133,6 +133,7 @@ Layering rules:
 | `max_tool_calls` | 500 | counted calls include `searchTools` (OC semantics) |
 | `default_search_limit` | 8 (pi's; OC's is 10) | script's explicit `limit` wins |
 | `memory_limit` | 256 MiB | pi's heap cap |
+| `max_stack_size` | 512 KiB | pi's default (`vm.ts:55-58`); enters the fingerprint (§5.5) |
 | `max_workers` / `worker_wait_ms` | 2 / 60,000 ms | pi's process-wide worker story |
 
 ### 5.3 Suspension & replay (capability, not wire)
@@ -151,13 +152,35 @@ Layering rules:
   `Date` reads the clock; `Math.random` = mulberry32(seed); no WeakRef /
   FinalizationRegistry; deterministic config travels in `SuspendState`.
 
-### 5.5 VM fingerprint (NEW — pi parity gap)
+### 5.5 VM fingerprint (RESOLVED, OQ5 — pi-exact)
 
-Every run reports a **fingerprint** before its first call (pi `types.ts:217-218`
-`onStarted?(fingerprint)`, `vm.ts:318`): engine version, bindings/prelude hash,
-determinism-semantics version, stack/heap/budget, interrupt-poll count. Resume
-refuses a `SuspendState` whose recorded fingerprint differs (replay safety).
-Composition details: **OQ5**.
+Every deterministic run reports a **fingerprint** before its first call —
+the `started` message precedes any call (pi `types.ts:217-218`,
+`deterministic.test.ts:180` asserts the `started → call → idle` order).
+Composition is pi's exact slot list (`vm.ts:319`), mapped to our stack:
+
+```
+rquickjs {version}, quickjs {libqjs version}, prelude {fnv1a-8hex(prelude source)},
+deterministic {DETERMINISTIC_VERSION}, stack {Budget.max_stack_size},
+heap {Budget.memory_limit}, budget none
+```
+
+- **prelude hash**: FNV-1a 32-bit (`0x811c9dc5` offset, `0x01000193` prime),
+  8 hex chars, over the full prelude JS source — pi `vm.ts:72-81`. Any
+  prelude change changes the fingerprint.
+- **`DETERMINISTIC_VERSION`** (`= 1`, core crate constant): bumped whenever a
+  replay-visible semantic changes (PRNG algorithm, UTC date behavior, result
+  application order). Version discipline guarded by pinned-value tests, as in
+  pi (`deterministic.test.ts:132`: *"a change here changes what replayed
+  scripts see, so it must change the fingerprint too"*;
+  `PINNED_FIRST_RANDOM`/`PINNED_SEED_ZERO`).
+- **`budget none`**: our deadline preemption uses the rquickjs interrupt
+  handler without counting polls — same as pi's in-thread backend
+  (`deterministic.test.ts:207` expects `budget none` there).
+- **Enforcement**: the fingerprint travels in `SuspendState`; `resume()`
+  refuses a mismatch (stronger than pi, which only reports to the host).
+- Output/tool-call limits are deliberately **not** in the fingerprint — pi
+  excludes them too; they affect output and call counts, not replay identity.
 
 ## 6. Script-facing surface
 
@@ -439,7 +462,7 @@ formatting) carry over — as reference, not as authority.
 | OQ2 | ~~Crate split~~ **RESOLVED** | keep v1's two crates (core contracts / quickjs engine + server handler); revisit only if the server layer grows worth independent release |
 | OQ3 | ~~Deferred listing policy~~ **RESOLVED — pi-exact** | upstream MCP tools never listed in the description (default `codemode` exposure); server list = system-prompt `mcp_servers` section (≤4,096 chars, ≤250/server), re-rendered per prompt, appended on change; discovery via `searchTools` + `describeNamespace`; codemode tool never redeclared for upstream changes; per-server exposure config `direct/codemode/deferred/hidden` (§7.1) |
 | OQ4 | ~~Name normalization~~ **RESOLVED — pi-exact, two layers** | server names: config-valid `[letters/digits/_/-]`, `-`≈`_` equivalence (same server, second rejected); tool names: non-alnum → `_`, colliding tools get hash suffixes (`docs/mcp.md:77`); engine-layer identifier fallback unchanged; four-spelling namespace acceptance (`:204`) (§8.1) |
-| OQ5 | Fingerprint composition | which hashes/versions enter the string; where it lives in `SuspendState` |
+| OQ5 | ~~Fingerprint composition~~ **RESOLVED — pi-exact** | pi's exact slot list: engine versions + FNV-1a prelude hash + `DETERMINISTIC_VERSION` (pinned-value-test discipline) + stack/heap from `Budget` (`max_stack_size` knob added) + `budget none`; enforced in `resume()` via `SuspendState` (§5.5) |
 | OQ6 | searchTools layer placement | bindings layer (v1) vs host/extension layer (pi's split) |
 | OQ7 | Upstream lifecycle API | **policy resolved** (pi `docs/mcp.md:100`: background connect, 10 s direct-wait, on-demand waits, retry 408/429/5xx ×2, reconnect on next call, tool-list change = add/unreachable — §8.3); remaining: Rust API shape |
 | OQ8 | codex-only globals | `notify()`, `setTimeout`, `generatedImage` adopt or reject |
