@@ -76,7 +76,8 @@ Key reads that shaped decisions:
 
 ## 4. Architecture — crate layering
 
-Proposed split (**OQ2 — resolved: keep v1's two-crate split**; core contracts
+Proposed split (**OQ2 — resolved: two-crate structure**, carried into the
+rewrite; core contracts
 without a JS engine, quickjs carrying engine + server handler. The engine is
 *not* required to be rmcp-free — the router library is consumed as a whole):
 
@@ -294,10 +295,26 @@ guard) get the same treatment from OC's four test files
 
 ### 11.4 Status of v1's tests
 
-v1's 55 tests are demoted: where they agree with a ported oracle test they are
-redundant; where they conflict, **the ported pi suite wins**; where they encode
-non-pi behavior we deliberately adopted (e.g. OpenCode semantics above), they
-are superseded by the OC ports of §11.3.
+v1's tests are **not ported** to v2 (the oracle replaces them; see OQ1). Where
+v1 code is consulted during the rewrite, only its QuickJS workarounds and
+verified bug fixes (non-negative BM25 IDF, counted search, total console
+formatting) carry over — as reference, not as authority.
+
+### 11.5 Rewrite sequence
+
+1. **Harness first**: port pi's sandbox API shape (`types.ts`: `execute`,
+   `start`/`deliver`, outcomes, `timeoutMs`, abort) to the Rust engine trait —
+   the public API is derived from pi's protocol, not from v1's `RunContext`.
+2. Port `sandbox.test.ts` (55) — engine implementation makes them pass;
+   prelude/bindings written as clean JS source + hash (pi's
+   `prelude-source.ts` shape), not Rust format strings.
+3. Port `deterministic.test.ts` (24), then `declarations.test.ts` (19 — full
+   `schemaToType` renderer).
+4. Port `portable`/`source`; document `worker-lifetime` cases `N/A` with
+   reasons where Rust threading differs.
+5. Port OC's four suites (§11.3).
+6. Upstream ingestion + naming (§8), catalog description (§7), server handler
+   (§10) with real-MCP fixtures (§11.2).
 
 ## 12. Out of scope (v2)
 
@@ -310,7 +327,7 @@ are superseded by the OC ports of §11.3.
 
 | # | Question | Options on the table |
 |---|---|---|
-| OQ1 | ~~v1 disposition~~ **RESOLVED** | salvage the engine code, but **replace the test authority**: port pi's 117-case suite mechanically (§11.1); failing ports are engine work items. v1's hand-written tests demoted (§11.4). Crate structure stays two crates (OQ2 resolved: keep v1's split; §4 revised) |
+| OQ1 | ~~v1 disposition~~ **RESOLVED** | **clean rewrite from this spec**, oracle-first: the ported pi suite (§11.1) is written before the engine that must pass it. v1 stays on main as reference material (QuickJS workarounds, verified fixes) until v2 passes the ported oracle suite, then archived; v1's hand-written tests are not ported (§11.4) |
 | OQ2 | ~~Crate split~~ **RESOLVED** | keep v1's two crates (core contracts / quickjs engine + server handler); revisit only if the server layer grows worth independent release |
 | OQ3 | Deferred listing policy + description stability | deferred-by-default for upstreams; promotion policy; byte-stability vs `tools/list_changed` redeclare |
 | OQ4 | Name normalization | charset rules for server/tool names → JS identifiers; normalized-name collision policy |
