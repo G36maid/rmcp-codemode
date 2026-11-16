@@ -263,7 +263,7 @@ heap {Budget.memory_limit}, budget {Budget.interrupt_budget ?? none}
 | Item | Status | Notes |
 |---|---|---|
 | `console` (pi formatter: JSON style, never throws, NaN/Infinity literal at the top level) | **KEEP — pi-style** | decision 2026-11-15: OC's DevTools-style total formatter (Map/Set/RegExp rich rendering, `[Circular]`, `[opaque reference]`) and `console.table`/`console.dir` are NOT adopted — the §6.1 "total formatter" note overstated the adoption; only never-throws + literal NaN/Infinity were ever shared with pi, and the engine already has both. OC's rich-formatting cases assert our pi-style output in `opencode_crosscheck.rs` with divergence labels |
-| `searchTools` / `describeTool` / `describeNamespace` | **KEEP — host layer** (OQ6 resolved) | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Registered by the router/server layer over the generic host-globals mechanism — NOT engine bindings (v1's placement dropped); the ServerHandler always wires them, so the MCP surface always has discovery; headless embedders opt in |
+| `searchTools` / `describeTool` / `describeNamespace` | **KEEP — host layer** (OQ6 resolved) | counted against `maxToolCalls`, observed in call records (OC semantics); BM25 non-negative IDF. Registered by the router/server layer over the generic host-globals mechanism — NOT engine bindings (v1's placement dropped); the ServerHandler always wires them, so the MCP surface always has discovery; headless embedders opt in. **Decision 2026-11-15: a separate native `tool_search` tool also exists** (pi-exact deferred exposure — see §7.1), so discovery has both the in-script globals and the native entry point |
 | `notify()` (mid-run output injection) | **REJECT** | tied to the rejected cell lifecycle; MCP has no mid-call content streaming — `notifications/progress` carries tokens, not content items, so there is no transport to ride |
 | `setTimeout` / `clearTimeout` | **REJECT** | pi/OC sandboxes have no script-facing timers; real-time timers break determinism (D11); virtual-clock timers are no-ops — virtual time advances only on delivered results, so timing is expressed by awaited calls |
 | `yield_control()` / cell primitives | **OUT** | tied to the cell lifecycle (§2 schism); rejected for v2 |
@@ -315,8 +315,12 @@ tools:
    next prompt.
 5. **Per-server exposure config** (pi `:120`): `direct` (declared natively,
    excluded from the catalog in `on` mode), `codemode` (default), `deferred`
-   (loaded by tool_search, then called directly — this is the set the
-   description's `deferred` parameter excludes, `tool.ts:389-395`), `hidden`.
+   (loaded by **the native `tool_search` tool**, then declared and called
+   directly — decision 2026-11-15: we implement the native `tool_search`
+   entry point pi-exact, reversing the earlier §6.2 no-separate-tool_search
+   framing; deferred tools' declarations stay out of the codemode
+   description's budgeted listing via its `deferred` parameter,
+   `tool.ts:389-395`), `hidden`.
 
 Consequence for the router: no byte-stability requirement on the codemode
 description (upstream changes never touch it); the only dynamic surface is the
