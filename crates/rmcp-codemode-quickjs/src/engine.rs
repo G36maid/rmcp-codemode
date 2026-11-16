@@ -1,11 +1,12 @@
-//! The QuickJS engine: pi's sandbox lifecycle over rquickjs, in-thread
-//! (SPEC §5). A fresh VM per run (D3), disposed on settle; preemption via the
-//! interrupt handler (deadline + abort), matching pi's in-thread backend.
+//! The QuickJS engine: pi's sandbox lifecycle over rquickjs (SPEC §5). A
+//! fresh VM per run (D3) on a dedicated thread with an explicit stack (pi's
+//! worker isolation: a spinning script cannot hurt the host); preemption via
+//! the interrupt handler (deadline + abort).
 //!
 //! Transport (internal, script-invisible): pi moves VM messages over worker
 //! threads; here the verbatim prelude runs inside the runtime's JS lifetime.
 //! Its `bridge(kind, a, b, c)` messages arrive in a Rust native; nested-call
-//! answers flow through an answer queue drained by a pump task that calls the
+//! answers flow through an answer queue drained by a pump that calls the
 //! prelude's own `settle` — the prelude stays a verbatim port, and `stalled()`
 //! keeps its never-settling semantics.
 
@@ -131,6 +132,8 @@ impl Engine for QuickJsEngine {
 
 // ---------------------------------------------------------------- shared ---
 
+/// Per-run state shared between the bridge native, the pump, and the tick
+/// loop.
 struct Shared {
     output: Mutex<Vec<OutputItem>>,
     calls: Mutex<Vec<Call>>,
@@ -148,8 +151,12 @@ struct Shared {
     abort_hit: AtomicBool,
     /// Cancels in-flight tool futures when the script ends or the run stops.
     tool_signal: CancellationToken,
-    /// The final result, stored by the bridge's `done` (or a fail path).
-    result: Mutex<Option<RunResult>>,
+    /// The bridge's `done` parts, stored raw; assembled into the final
+    /// RunResult after the grace period so cancelled calls are included.
+    done_parts: Mutex<Option<DoneParts>>,
+    /// A fail result stored by a stop-arm (abort/timeout), taking precedence
+    /// over `done_parts`.
+    fail_result: Mutex<Option<RunResult>>,
 }
 
 impl Shared {
@@ -167,7 +174,8 @@ impl Shared {
             // cancels this to stop unawaited tools (pi: "aborts unawaited
             // calls when the script returns").
             tool_signal: signal.child_token(),
-            result: Mutex::new(None),
+            done_parts: Mutex::new(None),
+            fail_result: Mutex::new(None),
         })
     }
 
@@ -211,8 +219,9 @@ impl Shared {
         }
     }
 
+    /// Assembles the final result. Call AFTER `cancel_outstanding()` so the
+    /// calls snapshot includes cancelled entries.
     fn assemble(&self, ok: bool, payload: Option<String>, writes: Option<String>) -> RunResult {
-        self.cancel_outstanding();
         let outcome = if self.deadline_hit.load(Ordering::Relaxed) {
             Err(ScriptError {
                 kind: ErrorKind::Timeout,
@@ -249,10 +258,10 @@ impl Shared {
                         Some([key, json_text]) if json_text.is_string() => {
                             // The write crosses as JSON TEXT; parse it into
                             // the typed write.
-                            if let Some(k) = key.as_str()
-                                && let Ok(parsed) =
-                                    serde_json::from_str::<Value>(json_text.as_str().unwrap())
-                            {
+                            if let (Some(k), Ok(parsed)) = (
+                                key.as_str(),
+                                serde_json::from_str::<Value>(json_text.as_str().unwrap()),
+                            ) {
                                 set.insert(k.to_owned(), parsed);
                             }
                         }
@@ -318,6 +327,10 @@ enum Answer {
 }
 
 type AnswerQueue = Arc<(AsyncMutex<VecDeque<Answer>>, Notify)>;
+
+/// The bridge's raw `done` parts: (ok, payload JSON, writes JSON). (pi:
+/// `done(ok, payloadJson, writesJson)`.)
+type DoneParts = (bool, Option<String>, Option<String>);
 
 /// One bridge message, parsed. (pi: `bridge(kind, a, b, c)`.)
 enum BridgeMsg {
@@ -501,8 +514,9 @@ fn register_bridge<'js>(
                 } => {
                     shared.finished.store(true, Ordering::Relaxed);
                     shared.tool_signal.cancel();
-                    let result = shared.assemble(ok, payload, writes);
-                    *shared.result.lock().unwrap() = Some(result);
+                    // Stored raw; assembled after the grace period so the
+                    // calls snapshot includes cancelled entries.
+                    *shared.done_parts.lock().unwrap() = Some((ok, payload, writes));
                 }
             }
         },
@@ -512,11 +526,55 @@ fn register_bridge<'js>(
 
 // ---------------------------------------------------------------- execute ---
 
+/// The dedicated VM thread's stack (pi: explicit worker stacks; see §5.1).
+const VM_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 async fn run_execute(
     script: String,
     sandbox: SandboxOptions,
     options: ExecuteOptions,
 ) -> RunResult {
+    // The whole VM lifecycle runs on a dedicated thread with a large stack
+    // and its own single-threaded runtime; the caller just awaits the result.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<RunResult>();
+    std::thread::Builder::new()
+        .name("codemode-vm".into())
+        .stack_size(VM_THREAD_STACK)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("vm runtime");
+            let result = rt.block_on(run_vm(script, sandbox, options));
+            let _ = done_tx.send(result);
+        })
+        .expect("spawn codemode-vm");
+    match done_rx.await {
+        Ok(result) => result,
+        // The VM thread panicked.
+        Err(_) => {
+            let mut fail = shared_fail_static(ErrorKind::Sandbox, "the VM thread panicked");
+            fail.output = Vec::new();
+            fail
+        }
+    }
+}
+
+fn shared_fail_static(kind: ErrorKind, message: &str) -> RunResult {
+    RunResult {
+        outcome: Err(ScriptError {
+            kind,
+            name: None,
+            message: message.to_owned(),
+            stack: None,
+        }),
+        output: vec![],
+        calls: vec![],
+        during: None,
+    }
+}
+
+async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions) -> RunResult {
     let shared = Shared::new(&options.signal.clone().unwrap_or_default());
     let run_signal = options.signal.clone().unwrap_or_default();
 
@@ -559,7 +617,9 @@ async fn run_execute(
     runtime
         .set_memory_limit(sandbox.memory_limit_bytes.unwrap_or(0) as usize)
         .await;
-    runtime.set_max_stack_size(1024 * 1024).await;
+    runtime
+        .set_max_stack_size(crate::fingerprint::MAX_STACK_SIZE)
+        .await;
     {
         let run_signal = run_signal.clone();
         let shared = Arc::clone(&shared);
@@ -581,9 +641,6 @@ async fn run_execute(
         .await
         .expect("rquickjs context");
 
-    // Setup runs inside the VM lock; the script's promise comes back so the
-    // tick loop below can drive the VM's job queue while we wait (pi: the
-    // worker drives the VM until the script settles).
     // Setup, pump, and tick loop all run INSIDE one async_with: awaiting the
     // script's promise future drives the VM's job queue (v1's mechanism), and
     // the tick timeout detects a never-settling script (pi `stalled()`).
@@ -606,14 +663,17 @@ async fn run_execute(
                     .map_err(|e| format!("prelude failed: {e}"))?;
                 let tools_json = json!(declarations).to_string();
                 let globals_json = json!(global_declarations).to_string();
-                // pi: storeJson is a snapshot of JSON TEXT — each value crosses as
-            // its JSON encoding, and the prelude parses on `load`.
-            let store_text: BTreeMap<&String, String> = options
-                .store
-                .iter()
-                .map(|(k, v)| (k, serde_json::to_string(v).unwrap_or_else(|_| "null".into())))
-                .collect();
-            let store_json = json!(store_text).to_string();
+                // pi: storeJson is a snapshot of JSON TEXT — each value
+                // crosses as its JSON encoding, and the prelude parses on
+                // `load`.
+                let store_text: BTreeMap<&String, String> = options
+                    .store
+                    .iter()
+                    .map(|(k, v)| {
+                        (k, serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
+                    })
+                    .collect();
+                let store_json = json!(store_text).to_string();
                 let api_obj: rquickjs::Object = prelude_fn
                     .call((bridge, tools_json, globals_json, store_json))
                     .map_err(|e| format!("prelude init failed: {e}"))?;
@@ -624,6 +684,10 @@ async fn run_execute(
                     .set("__pi_settle", settle)
                     .map_err(|e| e.to_string())?;
                 let mut eval_opts = rquickjs::context::EvalOptions::default();
+                // pi runs scripts as sloppy-mode global code; rquickjs's
+                // default eval is strict, which would make silent built-in
+                // patch assignments throw instead (pi escape-hatches case).
+                eval_opts.strict = false;
                 eval_opts.filename = Some("codemode.js".into());
                 let wrapped = format!("{SCRIPT_WRAPPER_PREFIX}{script}\n}})");
                 let script_fn: rquickjs::Function = vctx
@@ -638,8 +702,24 @@ async fn run_execute(
                 Err(e) => {
                     shared.finished.store(true, Ordering::Relaxed);
                     shared.tool_signal.cancel();
+                    // A done may already be stored (output-limit failures fire
+                    // `done` from inside run's synchronous prefix) — prefer it,
+                    // then classify interrupts by cause.
+                    if let Some((ok, payload, writes)) = shared.done_parts.lock().unwrap().take() {
+                        return shared.assemble(ok, payload, writes);
+                    }
+                    if shared.deadline_hit.load(Ordering::Relaxed) {
+                        let fail = shared.fail(ErrorKind::Timeout, "the deadline expired");
+                        *shared.fail_result.lock().unwrap() = Some(fail.clone());
+                        return fail;
+                    }
+                    if shared.abort_hit.load(Ordering::Relaxed) {
+                        let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
+                        *shared.fail_result.lock().unwrap() = Some(fail.clone());
+                        return fail;
+                    }
                     let fail = shared.fail(ErrorKind::Sandbox, &e);
-                    *shared.result.lock().unwrap() = Some(fail.clone());
+                    *shared.fail_result.lock().unwrap() = Some(fail.clone());
                     return fail;
                 }
             });
@@ -682,61 +762,121 @@ async fn run_execute(
             // idle ticks).
             let tick = Duration::from_millis(25);
             let mut idle_ticks = 0u32;
-            loop {
+            let done_parts: Option<DoneParts> = loop {
                 // Drive the VM's pending jobs (promise reactions: the body,
                 // the `then` that fires `done`, tool continuations).
                 while vctx.execute_pending_job() {}
-                // Stop-arms first: deadline/abort pre-empt everything.
-                if let Some(result) = shared.result.lock().unwrap().take() {
-                    break result;
+                // `done` through the bridge?
+                if let Some(parts) = shared.done_parts.lock().unwrap().take() {
+                    break Some(parts);
                 }
+                // Stop-arms: deadline/abort pre-empt everything.
                 if run_signal.is_cancelled() {
-                    break shared.fail(ErrorKind::Aborted, "the run was aborted");
+                    let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
+                    *shared.fail_result.lock().unwrap() = Some(fail);
+                    break None;
                 }
                 if deadline.is_some_and(|d| Instant::now() >= d) {
-                    break shared.fail(ErrorKind::Timeout, "the deadline expired");
+                    let fail = shared.fail(ErrorKind::Timeout, "the deadline expired");
+                    *shared.fail_result.lock().unwrap() = Some(fail);
+                    break None;
                 }
                 tokio::select! {
-                    _settled = &mut script_future => {
-                        // The script promise settled. `done` normally fired
-                        // through the bridge during the same poll; if it did
-                        // not, the idle logic below reports the never-settling
-                        // error on the next ticks.
-                        if let Some(result) = shared.result.lock().unwrap().take() {
-                            break result;
+                    settled = &mut script_future => {
+                        // The script promise settled — Ok (script returned) or
+                        // Err (an interrupt/deadline abort propagated as a
+                        // rejection). Classify by the stop flags; without a
+                        // flag, a settled promise with no call in flight is
+                        // waiting on something that can never settle.
+                        let failed = settled.is_err();
+                        let fail_message = match &settled {
+                            Err(err) => err.to_string(),
+                            Ok(_) => String::new(),
+                        };
+                        if shared.deadline_hit.load(Ordering::Relaxed) {
+                            let fail = shared.fail(ErrorKind::Timeout, "the deadline expired");
+                            *shared.fail_result.lock().unwrap() = Some(fail);
+                            break None;
+                        }
+                        if shared.abort_hit.load(Ordering::Relaxed) {
+                            let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
+                            *shared.fail_result.lock().unwrap() = Some(fail);
+                            break None;
+                        }
+                        if let Some(parts) = shared.done_parts.lock().unwrap().take() {
+                            break Some(parts);
+                        }
+                        if failed {
+                            let fail = shared.fail(ErrorKind::Script, &fail_message);
+                            *shared.fail_result.lock().unwrap() = Some(fail);
+                            break None;
                         }
                         if shared.outstanding.lock().unwrap().is_empty() {
                             idle_ticks += 1;
                             if idle_ticks >= 3 {
-                                break shared.fail(
+                                let fail = shared.fail(
                                     ErrorKind::Script,
                                     "script waits on a promise that can never settle (no timers; no tool call pending)",
                                 );
+                                *shared.fail_result.lock().unwrap() = Some(fail);
+                                break None;
                             }
                         }
                     }
                     _ = &mut pump => {
-                        break shared.fail(ErrorKind::Sandbox, "the answer pump stopped");
+                        let fail = shared.fail(ErrorKind::Sandbox, "the answer pump stopped");
+                        *shared.fail_result.lock().unwrap() = Some(fail);
+                        break None;
                     }
                     _ = tokio::time::sleep(tick) => {
                         // Idle tick: no progress in 25 ms.
                         if shared.finished.load(Ordering::Relaxed)
-                            && let Some(result) = shared.result.lock().unwrap().take()
+                            && let Some(parts) = shared.done_parts.lock().unwrap().take()
                         {
-                            break result;
+                            break Some(parts);
                         }
-                        if !shared.outstanding.lock().unwrap().is_empty() {
+                        if shared.outstanding.lock().unwrap().is_empty() {
+                            idle_ticks += 1;
+                            if idle_ticks >= 3 {
+                                let fail = shared.fail(
+                                    ErrorKind::Script,
+                                    "script waits on a promise that can never settle (no timers; no tool call pending)",
+                                );
+                                *shared.fail_result.lock().unwrap() = Some(fail);
+                                break None;
+                            }
+                        } else {
                             idle_ticks = 0;
                         }
                     }
                 }
+            };
+
+            // Grace period: cancelled in-flight tool tasks observe their abort
+            // signal on the VM runtime; keep it alive briefly so they settle
+            // (pi keeps the worker alive until calls settle).
+            let grace = Instant::now() + Duration::from_millis(100);
+            while !shared.outstanding.lock().unwrap().is_empty() && Instant::now() < grace {
+                while vctx.execute_pending_job() {}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            shared.cancel_outstanding();
+            match done_parts {
+                Some((ok, payload, writes)) => shared.assemble(ok, payload, writes),
+                None => match shared.fail_result.lock().unwrap().take() {
+                    Some(fail) => fail,
+                    None => shared.fail(
+                        ErrorKind::Script,
+                        "script waits on a promise that can never settle (no timers; no tool call pending)",
+                    ),
+                },
             }
         })
         .await;
     shared.cancel_outstanding();
-    shared.cancel_outstanding();
     result
 }
+
 // ------------------------------------------------------------- start mode ---
 
 fn run_start(

@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rmcp_codemode::{
@@ -18,6 +18,7 @@ use rmcp_codemode::{
 };
 use rmcp_codemode_quickjs::QuickJsEngine;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 // pi sandbox.test.ts:62-65 — base64 of the leading bytes of each format;
 // image() only inspects the signature.
@@ -511,7 +512,9 @@ async fn aborts_unawaited_calls_when_the_script_returns() {
         execute: Arc::new(move |_args, ctx| {
             let aborted = Arc::clone(&aborted2);
             Box::pin(async move {
+                eprintln!("DBG slow tool started");
                 ctx.signal.cancelled().await;
+                eprintln!("DBG slow tool observed cancel");
                 aborted.store(true, Ordering::Relaxed);
                 Err(ToolError {
                     message: "aborted".into(),
@@ -527,10 +530,9 @@ async fn aborts_unawaited_calls_when_the_script_returns() {
     assert_eq!(result.calls.len(), 1);
     assert_eq!(result.calls[0].name, "slow");
     assert_eq!(result.calls[0].status, CallStatus::Cancelled);
-    // The spawned tool task observes the cancellation on a later scheduler
-    // pass; yield so it can record its abort.
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    // The tool task runs on the VM thread; give it a moment to observe the
+    // cancellation.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(aborted.load(Ordering::Relaxed));
 }
 
@@ -732,4 +734,337 @@ fn create_sandbox_store_global(name: &str) -> QuickJsEngine {
         }],
         ..SandboxOptions::default()
     })
+}
+
+// ------------------------------------------- limits and lifetime (pi 560+) ---
+
+// pi: sandbox.test.ts > limits and lifetime > terminates a synchronous
+// infinite loop on timeout.
+#[tokio::test(flavor = "current_thread")]
+async fn terminates_sync_infinite_loop_on_timeout() {
+    let sandbox = create_sandbox(vec![]);
+    let started = Instant::now();
+    let result = sandbox
+        .execute(
+            "while (true) {}",
+            ExecuteOptions {
+                timeout_ms: Some(200),
+                ..Default::default()
+            },
+        )
+        .await;
+    let error = result.outcome.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+// pi: sandbox.test.ts > limits and lifetime > runs without a deadline when
+// timeoutMs is Infinity. Port: `None` = no deadline anywhere.
+#[tokio::test(flavor = "current_thread")]
+async fn runs_without_deadline_when_disabled() {
+    let wait = Tool {
+        name: "wait".into(),
+        execute: Arc::new(|_args, _ctx| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(json!("late"))
+            })
+        }),
+        ..echo_tool()
+    };
+    // Sandbox with no default deadline; run without an override.
+    let sandbox = QuickJsEngine::new(SandboxOptions {
+        tools: vec![wait],
+        ..SandboxOptions::default()
+    });
+    let result = sandbox
+        .execute("return await tools.wait()", ExecuteOptions::default())
+        .await;
+    assert_eq!(result.outcome.as_ref().unwrap().value, json!("late"));
+}
+
+// pi: sandbox.test.ts > limits and lifetime > fails a script that waits on a
+// promise nothing can settle. Returning while a call is still pending is NOT
+// a stall.
+#[tokio::test(flavor = "current_thread")]
+async fn fails_never_settling_promise() {
+    let sandbox = create_sandbox(vec![echo_tool()]);
+    let result = sandbox
+        .execute(
+            "await tools.echo(1); await new Promise(() => {}); return 'never'",
+            ExecuteOptions::default(),
+        )
+        .await;
+    let error = result.outcome.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Script);
+    assert!(
+        error.message.contains("can never settle"),
+        "{}",
+        error.message
+    );
+
+    // Returning while a call is still pending is not a stall.
+    let returned = sandbox
+        .execute("tools.echo(2); return 'early'", ExecuteOptions::default())
+        .await;
+    assert_eq!(returned.outcome.as_ref().unwrap().value, json!("early"));
+}
+
+// pi: sandbox.test.ts > limits and lifetime > terminates a microtask-spinning
+// loop on timeout.
+#[tokio::test(flavor = "current_thread")]
+async fn terminates_microtask_spin_on_timeout() {
+    let sandbox = create_sandbox(vec![]);
+    let result = sandbox
+        .execute(
+            "while (true) await null",
+            ExecuteOptions {
+                timeout_ms: Some(200),
+                ..Default::default()
+            },
+        )
+        .await;
+    eprintln!("DBG microtask error: {:?}", result.outcome);
+    assert_eq!(result.outcome.unwrap_err().kind, ErrorKind::Timeout);
+}
+
+// pi: sandbox.test.ts > limits and lifetime > aborts via signal and cancels
+// in-flight calls. Port adaptation: the pi case also exercises sandbox.close()
+// and a shared tool-signal across runs; our contract has no close — the two
+// abort shapes are ported per-run.
+#[tokio::test(flavor = "current_thread")]
+async fn abort_via_signal_cancels_in_flight_calls() {
+    let hang = Tool {
+        name: "hang".into(),
+        execute: Arc::new(|_args, _ctx| {
+            Box::pin(async { futures::future::pending::<Result<Value, ToolError>>().await })
+        }),
+        ..echo_tool()
+    };
+    let sandbox = create_sandbox(vec![hang]);
+
+    // A run aborted mid-flight while a tool call is in flight: the call
+    // records as cancelled. Cancel after the call is issued (pi:
+    // `second.abort()` after `nextCall`).
+    let token = CancellationToken::new();
+    let run_fut = sandbox.execute(
+        "await tools.hang(); return 'never'",
+        ExecuteOptions {
+            signal: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(run_fut);
+    // Drive the run for 100 ms: the script body runs and the tool call is
+    // issued (the tool hangs forever). Then abort mid-flight.
+    let _ = tokio::time::timeout(Duration::from_millis(100), run_fut.as_mut()).await;
+    token.cancel();
+    let result = run_fut.await;
+    let error = result.outcome.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Aborted);
+    assert_eq!(error.message, "the run was aborted");
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name, "hang");
+    assert_eq!(result.calls[0].status, CallStatus::Cancelled);
+    let _ = token; // cancellation happened through the run's own signal
+}
+
+// pi: sandbox.test.ts > limits and lifetime > fails a script whose output
+// passes the limits, even if it catches the error (#10283).
+#[tokio::test(flavor = "current_thread")]
+async fn output_limits_hold_even_when_caught() {
+    use rmcp_codemode::types::OutputItem;
+    let sandbox = create_sandbox(vec![]);
+    for print in [
+        "text(s)",
+        "console.log(s)",
+        r#"image("data:image/png;base64," + p)"#,
+    ] {
+        let script = format!(
+            r#"
+					const s = "x".repeat(1 << 20);
+					const p = "iVBORw0KGgoA" + "A".repeat(1 << 20);
+					for (;;) {{ try {{ {print}; }} catch {{}} }}
+				"#
+        );
+        let result = sandbox.execute(&script, ExecuteOptions::default()).await;
+        let error = result.outcome.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Script);
+        assert_eq!(error.name.as_deref(), Some("RangeError"));
+        assert!(
+            error.message.contains("script output exceeded"),
+            "{}",
+            error.message
+        );
+        let chars: usize = result
+            .output
+            .iter()
+            .map(|item| match item {
+                OutputItem::Text { text, .. } => text.len(),
+                OutputItem::Image { data, .. } => data.len(),
+            })
+            .sum();
+        assert!(chars <= MAX_OUTPUT_CHARS);
+        assert!(chars > MAX_OUTPUT_CHARS - (2 << 20));
+    }
+
+    // Empty strings: the item limit is what trips.
+    let empty = sandbox
+        .execute("for (;;) text(\"\");", ExecuteOptions::default())
+        .await;
+    let error = empty.outcome.unwrap_err();
+    assert_eq!(error.name.as_deref(), Some("RangeError"));
+    assert_eq!(empty.output.len(), MAX_OUTPUT_ITEMS);
+}
+
+const MAX_OUTPUT_CHARS: usize = 16 * 1024 * 1024;
+const MAX_OUTPUT_ITEMS: usize = 100_000;
+
+// pi: sandbox.test.ts > limits and lifetime > rejects execute after close.
+// Port note: N/A — our contract has no close(); engines are owned by the
+// embedder and dropping one stops runs.
+
+// pi: sandbox.test.ts > limits and lifetime > runs executions in parallel
+// without sharing state.
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_executions_without_shared_state() {
+    use futures::future::join_all;
+    let sandbox = create_sandbox(vec![]);
+    let results = join_all([
+        sandbox.execute(
+            "globalThis.shared = 'a'; await null; return globalThis.shared",
+            ExecuteOptions::default(),
+        ),
+        sandbox.execute(
+            "globalThis.shared = 'b'; await null; return globalThis.shared",
+            ExecuteOptions::default(),
+        ),
+        sandbox.execute("return typeof globalThis.shared", ExecuteOptions::default()),
+    ])
+    .await;
+    let values: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.outcome.as_ref().unwrap().value.clone())
+        .collect();
+    assert_eq!(values, vec![json!("a"), json!("b"), json!("undefined")]);
+}
+
+// pi: sandbox.test.ts > limits and lifetime > turns deep recursion into a
+// catchable RangeError.
+#[tokio::test(flavor = "current_thread")]
+async fn deep_recursion_is_catchable_range_error() {
+    let sandbox = create_sandbox(vec![]);
+    let result = sandbox
+        .execute(
+            r#"
+				let depth = 0;
+				function dive() { depth++; dive(); }
+				try { dive(); } catch (error) { return [error.name, depth > 1000]; }
+			"#,
+            ExecuteOptions::default(),
+        )
+        .await;
+    assert_eq!(
+        result.outcome.as_ref().unwrap().value,
+        json!(["RangeError", true])
+    );
+}
+
+// ------------------------------------------------ escape hatches (pi 697+) ---
+
+// pi: sandbox.test.ts > escape hatches > has no host globals.
+#[tokio::test(flavor = "current_thread")]
+async fn no_host_globals() {
+    let sandbox = create_sandbox(vec![]);
+    let result = sandbox
+        .execute(
+            r#"
+				return [
+					typeof process, typeof require, typeof module, typeof setTimeout, typeof fetch,
+					typeof WebAssembly, typeof std, typeof os, typeof globalThis.constructor,
+				]
+			"#,
+            ExecuteOptions::default(),
+        )
+        .await;
+    assert_eq!(
+        result.outcome.as_ref().unwrap().value,
+        json!([
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "undefined",
+            "function"
+        ])
+    );
+}
+
+// pi: sandbox.test.ts > escape hatches > keeps eval and Function inside the
+// VM. Code generation is allowed: it can only produce more code in the same
+// VM instance.
+#[tokio::test(flavor = "current_thread")]
+async fn eval_and_function_stay_in_the_vm() {
+    let sandbox = create_sandbox(vec![echo_tool()]);
+    let result = sandbox
+        .execute(
+            r#"
+				return [
+					eval("typeof process"),
+					new Function("return typeof process")(),
+					tools.echo.constructor("return typeof require")(),
+					(async () => {}).constructor("return typeof setTimeout")() instanceof Promise,
+				];
+			"#,
+            ExecuteOptions::default(),
+        )
+        .await;
+    assert_eq!(
+        result.outcome.as_ref().unwrap().value,
+        json!(["undefined", "undefined", "undefined", true])
+    );
+}
+
+// pi: sandbox.test.ts > escape hatches > rejects dynamic import.
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_import_rejected() {
+    let sandbox = create_sandbox(vec![]);
+    let result = sandbox
+        .execute(
+            r#"try { await import("node:fs"); return "imported"; } catch (error) { return error.constructor.name; }"#,
+            ExecuteOptions::default(),
+        )
+        .await;
+    let value = result.outcome.as_ref().unwrap().value.clone();
+    assert_ne!(value, json!("imported"));
+}
+
+// pi: sandbox.test.ts > escape hatches > ignores patches to built-ins and
+// built-in globals (#10444).
+#[tokio::test(flavor = "current_thread")]
+async fn builtin_patches_are_ignored() {
+    let sandbox = create_sandbox(vec![echo_tool()]);
+    let result = sandbox
+        .execute(
+            r#"
+				Array.prototype.toJSON = () => null;
+				Object.prototype.toJSON = () => 5;
+				Promise.prototype.then = () => {};
+				Map.prototype.get = () => undefined;
+				globalThis.JSON = { stringify: () => "x", parse: () => "x" };
+				store("k", [1]);
+				return [await tools.echo([2]), JSON.stringify({ a: 1 })];
+			"#,
+            ExecuteOptions::default(),
+        )
+        .await;
+    assert_eq!(
+        result.outcome.as_ref().unwrap().value,
+        json!([[2], r#"{"a":1}"#])
+    );
+    let writes = &result.outcome.as_ref().unwrap().store_writes;
+    assert_eq!(writes.set.get("k"), Some(&json!([1])));
 }

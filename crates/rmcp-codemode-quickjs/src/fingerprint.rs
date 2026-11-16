@@ -16,9 +16,12 @@ pub const DETERMINISTIC_VERSION: u64 = 1;
 /// does not expose the embedded QuickJS version string.
 pub const ENGINE_VERSION: &str = "rquickjs/0.14";
 
-/// The default QuickJS stack size, mirroring pi's `MAX_STACK_SIZE` (512 KiB,
-/// `vm.ts:55-58`).
-pub const MAX_STACK_SIZE: usize = 512 * 1024;
+/// The default QuickJS stack budget. pi uses 512 KiB in a 4 MB wasm worker;
+/// rquickjs's native frames are larger and the VM runs on a dedicated thread
+/// with an explicit 16 MiB stack (pi-faithful worker isolation), so 4 MiB is
+/// a safe budget: deep-recursion oracle reaches ~2500 frames (pi's
+/// deep-recursion test expects > 1000). Enters the fingerprint (§5.5).
+pub const MAX_STACK_SIZE: usize = 4 * 1024 * 1024;
 
 /// The fingerprint string, pi's slot list mapped to our stack. `budget` is
 /// always `none`: deadline preemption uses the interrupt handler without
