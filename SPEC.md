@@ -69,14 +69,16 @@ Key reads that shaped decisions:
 | D5 | Approval over MCP wire | **not in v2** — runs execute directly within budgets; engine keeps `SuspendingEngine` for embedders and a future wire design (elicitation is the likely vehicle) | LOCKED | design review 2026-11 |
 | D6 | Native tools | **embedder's right**: the crate accepts native tools into the Space; the crate itself ships none | LOCKED | pi `tool.ts:164-166` (`getCodemodeCallableTools` = all session tools minus codemode itself); CC `$`/`edit()` |
 | D7 | Script surface | **convergent intersection is core**; per-implementation extras are opt-in profile items (§6.2) | LOCKED (core) | §2 convergent core list |
-| D8 | Conformance testing | contract tests run against **real MCP servers** (rmcp in-process wire + one spawned stdio upstream); mocks only for engine internals | LOCKED | v1's tests are mock-heavy — flagged in review |
+| D8 | Conformance testing | **pi's own test suite, ported mechanically, is the conformance instrument** (same scripts, fixtures, assertions; each test labeled with its pi source); real-MCP fixtures on the ingestion axis; mocks only for engine-internal units | LOCKED | v1's hand-written tests verify the porter's *impression* of pi, not pi — rejected in review; the ported suite is the oracle |
 | D9 | Tool description | catalog lives in the **codemode tool description** (not system prompt): TS declarations grouped by namespace, budgeted, deferred-aware | LOCKED | pi `tool.ts:229-272`; §7 |
 | D10 | Budget constants | pi-aligned (§5.2) | LOCKED | pi `execute.ts:52,306-307`; v1 `Budget::default()` matches |
 | D11 | Determinism | virtual clock (advances only on delivered outcomes, never backward) + seeded mulberry32; WeakRef/FinalizationRegistry removed | LOCKED | pi `vm.ts:83-103`; `protocol.ts:24` |
 
 ## 4. Architecture — crate layering
 
-Proposed split (**OQ2** — exact boundaries pending):
+Proposed split (**OQ2 — resolved: keep v1's two-crate split**; core contracts
+without a JS engine, quickjs carrying engine + server handler. The engine is
+*not* required to be rmcp-free — the router library is consumed as a whole):
 
 ```
 rmcp-codemode            core contracts, no JS:
@@ -84,25 +86,23 @@ rmcp-codemode            core contracts, no JS:
                          Budget, Engine trait, SuspendingEngine trait,
                          SuspendState / Determinism / results,
                          upstream ingestion (space_from_peer), naming rules
-        ▲                            ▲
-        │                            │
-rmcp-codemode-quickjs    rmcp-codemode-server (proposed split, OQ2)
-QuickJS engine:          rmcp `ServerHandler` component:
+        ▲
+        │
+rmcp-codemode-quickjs    QuickJS engine + rmcp ServerHandler component:
 fresh VM per run,        one codemode tool (+ optional direct tools per Mode),
 bindings, proxy tree,    catalog description, store domains via _meta,
 dispatch, budgets,       suspension/pause API surface for embedders
-determinism,                       │
-suspension/replay        transports wired by the EMBEDDER (stdio, HTTP, in-process)
+determinism,
+suspension/replay        transports wired by the EMBEDDER
 ```
 
 Layering rules:
 
-- `quickjs` depends on core; server depends on both. The core crate never links a
-  JS engine.
-- A headless embedder (tests, non-MCP hosts) takes core + quickjs and drives the
-  engine trait directly. An MCP embedder adds the server component.
-- Engine trait is the spec's applicability boundary: everything in §5–§7 is
-  engine-contract territory; §8–§10 is router/server territory.
+- `quickjs` depends on core. The core crate never links a JS engine; the rmcp
+  dependency spans both crates by design (the integration surface is the
+  whole router library).
+- An embedder drives the engine trait directly for headless testing; MCP
+  hosts consume the `ServerHandler`.
 
 ## 5. Engine contract (pi model)
 
@@ -251,15 +251,53 @@ dynamic upstreams (**OQ3**):
 
 ## 11. Conformance & testing
 
-- **Real MCP servers as test fixtures** (D8): rmcp in-process servers exercising
-  real wire semantics, plus at least one spawned stdio subprocess upstream in CI.
-- Parity suites lock cross-implementation semantics:
-  - pi: lifecycle, suspension/deliver replay, determinism trajectories,
-    budget messages, worker-pool admission, catalog packing.
-  - OpenCode: counted search, total console formatting, tool-path probes
-    (`prototype`/`__proto__`/poisoning/bracket names), close-match guard.
-  - naming: `mcp__<server>__<tool>` canonicalization + normalization tables.
-- v1's 55 tests are the floor, not the ceiling.
+### 11.1 The oracle: pi's own suite, ported mechanically
+
+v1's hand-written tests encode the porter's impression of pi and are **not** the
+standard. The standard is pi's codemode test suite
+(`packages/codemode/test/`, 117 cases), ported one-by-one: **same JS script
+strings, same fixtures, same assertions**, each Rust test labeled with its pi
+source (`pi:sandbox.test.ts > tools > aborts unawaited calls…`). A ported test
+that cannot apply to the Rust engine (TS-worker specifics) is documented `N/A`
+with the reason — never silently dropped. Every failing port is a semantic
+divergence to fix in the engine, not a test to weaken.
+
+Inventory:
+
+| pi file | cases | covers (already-visible v1 divergences) |
+|---|---|---|
+| `sandbox.test.ts` | 55 | script execution, output order, exit()/partial-output-on-failure, **V8-style stacks without prelude frames**, line-numbered errors, non-Error throws, tools (records, concurrency, normalized identifiers, unawaited-call aborts, close-match naming), store (snapshot+writes, copies, in-script oversized rejection), globals (namespaced, **argument spreading**, reserved-name rejection), limits (**uncatchable abort error**, never-settling promise, output limits hold even when caught, parallel runs share nothing), escape hatches (no host globals, eval/Function caged, dynamic import rejected, built-in patches ignored) |
+| `deterministic.test.ts` | 24 | same calls/output for same start/seed/results; UTC regardless of host tz; **results applied in seq order regardless of delivery order**; **fingerprint before first call**; **clock monotonic + rejects non-finite delivered `now_ms`**; unserializable answers leave the call waiting; abort = uncatchable; double-delivery rejected |
+| `declarations.test.ts` | 19 | `schemaToType`: budget→unknown, draft-04 constraints, `$ref` resolution with recursion stop, arrays/tuples — the description catalog's declaration renderer |
+| `portable.test.ts` | 7 | port with adaptation notes |
+| `worker-lifetime.test.ts` | 7 | TS-worker specifics — likely `N/A` (Rust threading differs); document per-case |
+| `source.test.ts` | 5 | embedded sources parse; port |
+
+Known v1 gaps already legible from test names (to be confirmed by the port):
+V8-style stack formatting, uncatchable abort errors, non-finite clock-value
+rejection, seq-order application, namespaced globals with argument spreading,
+registration-time reserved-name rejection, and the full `schemaToType`
+renderer (v1's `ts_declaration` is a simplification).
+
+### 11.2 Real-MCP ingestion fixtures (D8)
+
+rmcp in-process servers over real wire semantics, plus one spawned stdio
+subprocess upstream in CI; naming conformance (`mcp__<server>__<tool>`,
+normalization tables) tested against live upstream tool names.
+
+### 11.3 OpenCode-adopted semantics
+
+The OC-adopted behaviors (counted `searchTools`, total console formatting,
+tool-path probes: `prototype`/`__proto__`/poisoning/bracket names, close-match
+guard) get the same treatment from OC's four test files
+(`codemode/errors/limits/tool-paths.test.ts`): mechanical ports, labeled.
+
+### 11.4 Status of v1's tests
+
+v1's 55 tests are demoted: where they agree with a ported oracle test they are
+redundant; where they conflict, **the ported pi suite wins**; where they encode
+non-pi behavior we deliberately adopted (e.g. OpenCode semantics above), they
+are superseded by the OC ports of §11.3.
 
 ## 12. Out of scope (v2)
 
@@ -272,8 +310,8 @@ dynamic upstreams (**OQ3**):
 
 | # | Question | Options on the table |
 |---|---|---|
-| OQ1 | v1 disposition | (a) salvage quickjs engine + core crates, rewrite router/server layers; (b) full rewrite from spec, v1 kept as reference branch |
-| OQ2 | Crate split | three crates as proposed in §4 vs two (fold server into quickjs) |
+| OQ1 | ~~v1 disposition~~ **RESOLVED** | salvage the engine code, but **replace the test authority**: port pi's 117-case suite mechanically (§11.1); failing ports are engine work items. v1's hand-written tests demoted (§11.4). Crate structure stays two crates (OQ2 resolved: keep v1's split; §4 revised) |
+| OQ2 | ~~Crate split~~ **RESOLVED** | keep v1's two crates (core contracts / quickjs engine + server handler); revisit only if the server layer grows worth independent release |
 | OQ3 | Deferred listing policy + description stability | deferred-by-default for upstreams; promotion policy; byte-stability vs `tools/list_changed` redeclare |
 | OQ4 | Name normalization | charset rules for server/tool names → JS identifiers; normalized-name collision policy |
 | OQ5 | Fingerprint composition | which hashes/versions enter the string; where it lives in `SuspendState` |
