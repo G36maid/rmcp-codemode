@@ -86,7 +86,7 @@ pub enum CallStatus {
 }
 
 /// A nested call the script made. (pi: `CodemodeCall`.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Call {
     pub name: String,
     pub status: CallStatus,
@@ -110,7 +110,7 @@ pub enum ErrorKind {
 }
 
 /// A run failure. (pi: `CodemodeError`.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ScriptError {
     pub kind: ErrorKind,
     pub name: Option<String>,
@@ -120,7 +120,7 @@ pub struct ScriptError {
 
 /// Keys the script changed with `store()`; only successful runs report writes.
 /// (pi: `CodemodeStoreWrites`.)
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct StoreWrites {
     pub set: BTreeMap<String, Value>,
     /// Keys stored as `undefined`.
@@ -130,7 +130,7 @@ pub struct StoreWrites {
 /// The result the script itself ended with (returned, threw, or exited):
 /// result `seq` was being processed, and `issued` calls had been issued.
 /// (pi: `CodemodeDuring`.)
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub struct During {
     pub seq: u64,
     pub issued: u64,
@@ -139,7 +139,7 @@ pub struct During {
 /// The outcome of an execution. `output` and `calls` are kept for failed runs
 /// too, up to the failure. (pi: `CodemodeResult`; the shared fields are
 /// factored out Rust-style.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RunResult {
     /// `Ok` = the script returned (or `exit()`ed with `value: None`);
     /// `Err` = it threw/timed out/was aborted/the sandbox failed.
@@ -151,7 +151,7 @@ pub struct RunResult {
 
 /// The success half of [`RunResult`]. (pi: the `ok: true` variant of
 /// `CodemodeResult`.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Success {
     /// The script's return value; `exit()` completes with `Value::Null`.
     pub value: Value,
@@ -160,7 +160,7 @@ pub struct Success {
 
 /// A call the script made in a host-controlled run, answered via
 /// `crate::engine::RunHandle::deliver`. (pi: `CodemodeHostCall`.)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HostCall {
     /// The VM's own number for the call: `1`, `2`, … in the order the script
     /// made its calls (tools and globals).
@@ -182,7 +182,7 @@ pub enum CallTarget {
 
 /// A tool as a host-controlled run's script sees it. (pi:
 /// `CodemodeDeclaredTool`.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeclaredTool {
     pub name: String,
     /// The identifier the script uses, `tools.<js_name>`; default
@@ -195,7 +195,7 @@ pub struct DeclaredTool {
 
 /// A global as a host-controlled run's script sees it. (pi:
 /// `CodemodeDeclaredGlobal`.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeclaredGlobal {
     pub name: String,
     pub spread: bool,
