@@ -75,6 +75,7 @@ Key reads that shaped decisions:
 | D11 | Determinism | virtual clock (advances only on delivered outcomes, never backward) + seeded mulberry32; WeakRef/FinalizationRegistry removed | LOCKED | pi `vm.ts:83-103`; `protocol.ts:24` |
 | D12 | MCP protocol baseline | spec **2025-11-25** + the Final SEPs we rely on (§10.1); `_meta` keys use reverse-DNS prefix `io.github.g36maid/` (v1's `codemode/storeDomain` violates the SHOULD and is renamed); tool naming complies with SEP-986; Tasks extension tracked as the future wire vehicle (D5) | LOCKED | verified against modelcontextprotocol.io 2026-11 |
 | D13 | Upstream aggregation semantics | **pi-exact** (§8.2): tools + resources-as-tools (no prompts); `isError` resolves to scripts (model-facing output marked), v1's Err-rejection dropped; annotation hints forwarded, icons/`_meta` stripped; minimal client capabilities; truncated output saved with `fullOutputPath`; auth = embedder's boundary (crate consumes connected peers) | LOCKED | pi `tools.ts:8-10,135-232,275-278`; `resources.ts:53-55`; `index.ts:387`; verified 2026-11 |
+| D14 | Engine contract shape | (a) no Space — flat tool lists, catalog/search at server layer; (b) `execute` + `start`/`deliver` only, replay is host-layer, v1's internal replay dispatcher dropped; (c) abort = `CancellationToken`; (d) types mirror `types.ts` 1:1 (§5.0) | LOCKED | pi `types.ts` full read 2026-11; user-approved |
 
 ## 4. Architecture — crate layering
 
@@ -108,6 +109,37 @@ Layering rules:
   hosts consume the `ServerHandler`.
 
 ## 5. Engine contract (pi model)
+
+### 5.0 Contract shape (D14 — locked 2026-11)
+
+Four locked decisions from the `types.ts` full read:
+
+- **(a) No Space in the engine contract.** The engine takes pi's flat lists —
+  `tools: Vec<Tool>` and `globals: Vec<Tool>` — plus per-run declared tools
+  for host-controlled runs. v1's hierarchical `Space` is gone from the core
+  crate; catalog rendering (§7), the search index, and `searchTools` wiring
+  live at the server layer (§6.1, OQ3/OQ6 consequences).
+- **(b) `execute` + `start`/`deliver` are the only mechanisms.** Mode 1
+  (`execute(script, options)`): run-to-completion, host-supplied tool
+  closures, returns the full result. Mode 2 (`start(runOptions)`):
+  host-controlled — the engine receives only **declarations**
+  (`DeclaredTool {name, js_name, description}`), reports
+  `on_call(HostCall {id, target, name, args})`, and the host answers via
+  `run.deliver(seq, now, id, outcome)`: results numbered 1,2,… without gaps,
+  applied strictly in seq order regardless of arrival order; the clock reads
+  `now` while processing, never backward; `on_started(fingerprint)` precedes
+  any call; `during {seq, issued}` reports what was in flight when the script
+  ended. **Replay is host-layer**: a resumed run is a fresh `start()` fed the
+  recorded (calls, outcomes, started_at, seed, fingerprint) — the
+  deterministic guarantees make it converge. v1's engine-internal
+  `Dispatcher::Replay` is not carried over; `SuspendState` becomes a
+  host-side record type.
+- **(c) Abort signal** = `tokio_util::sync::CancellationToken` (pi
+  `AbortSignal`'s Rust equivalent; aborted on finish/timeout/abort/close).
+- **(d) Core types mirror `types.ts` 1:1** — `Tool`, `OutputItem`, `Call`,
+  `RunResult`, `HostCall`, `Outcome`, `During`, `RunOptions`, `Run`,
+  `ExecuteOptions`, `SandboxOptions` — snake_case fields, each doc-commented
+  with its pi source name for port traceability.
 
 ### 5.1 Execution lifecycle
 
