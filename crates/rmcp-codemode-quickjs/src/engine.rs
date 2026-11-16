@@ -24,8 +24,9 @@ use rmcp_codemode::{
     engine::{Engine, RunHandle},
     naming::to_codemode_identifier,
     types::{
-        Call, CallStatus, DeliverError, ErrorKind, ExecuteOptions, Outcome, OutputItem, RunOptions,
-        RunResult, SandboxOptions, ScriptError, StoreWrites, Success, Tool, ToolContext, ToolError,
+        Call, CallStatus, CallTarget, DeliverError, During, ErrorKind, ExecuteOptions, HostCall,
+        Outcome, OutputItem, RunOptions, RunResult, SandboxOptions, ScriptError, StoreWrites,
+        Success, Tool, ToolContext, ToolError,
     },
 };
 use rquickjs::{AsyncContext, AsyncRuntime, IntoJs, Undefined};
@@ -35,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     clock::{Mulberry32, VirtualClock},
+    fingerprint::fingerprint,
     prelude::{PRELUDE_SOURCE, SCRIPT_WRAPPER_PREFIX},
 };
 
@@ -157,6 +159,27 @@ struct Shared {
     /// A fail result stored by a stop-arm (abort/timeout), taking precedence
     /// over `done_parts`.
     fail_result: Mutex<Option<RunResult>>,
+    /// The run has decided its outcome (done or fail). Outlives the consumed
+    /// done_parts/fail_result so `finished()` stays true after `result()`
+    /// (pi: the run is finished once it has its outcome).
+    decided: AtomicBool,
+    /// Start-mode callbacks (host answers calls) and the deterministic state.
+    /// (The boxed-fn option types are spelled via aliases below to keep the
+    /// struct readable.)
+    on_call: OnCallSlot,
+    on_idle: OnIdleSlot,
+    on_started: OnStartedSlot,
+    clock: Arc<Mutex<VirtualClock>>,
+    rng: Arc<Mutex<Mulberry32>>,
+    /// Delivered answers held until their seq arrives (pi: "after a gap it
+    /// waits for the missing number").
+    held: Mutex<HashMap<u64, (u64, u64, Outcome)>>,
+    /// The next result number the VM will apply (1-based).
+    next_seq: AtomicU64,
+    /// The seq of the last applied result (0 = none yet) — `during` tracking.
+    last_settled_seq: AtomicU64,
+    /// The answer queue (pump drain target).
+    answers: AnswerQueue,
 }
 
 impl Shared {
@@ -176,6 +199,16 @@ impl Shared {
             tool_signal: signal.child_token(),
             done_parts: Mutex::new(None),
             fail_result: Mutex::new(None),
+            decided: AtomicBool::new(false),
+            on_call: Mutex::new(None),
+            on_idle: Mutex::new(None),
+            on_started: Mutex::new(None),
+            clock: Arc::new(Mutex::new(VirtualClock::new(0))),
+            rng: Arc::new(Mutex::new(Mulberry32::new(1))),
+            held: Mutex::new(HashMap::new()),
+            next_seq: AtomicU64::new(1),
+            last_settled_seq: AtomicU64::new(0),
+            answers: Arc::new((AsyncMutex::new(VecDeque::new()), Notify::new())),
         })
     }
 
@@ -304,6 +337,7 @@ impl Shared {
     }
 
     fn fail(&self, kind: ErrorKind, message: &str) -> RunResult {
+        self.decided.store(true, Ordering::Relaxed);
         self.cancel_outstanding();
         RunResult {
             outcome: Err(ScriptError {
@@ -327,6 +361,10 @@ enum Answer {
 }
 
 type AnswerQueue = Arc<(AsyncMutex<VecDeque<Answer>>, Notify)>;
+
+type OnCallSlot = Mutex<Option<Box<dyn Fn(HostCall) + Send>>>;
+type OnIdleSlot = Mutex<Option<Box<dyn Fn(u64, u64) + Send>>>;
+type OnStartedSlot = Mutex<Option<Box<dyn Fn(String) + Send>>>;
 
 /// The bridge's raw `done` parts: (ok, payload JSON, writes JSON). (pi:
 /// `done(ok, payloadJson, writesJson)`.)
@@ -431,6 +469,43 @@ fn register_bridge<'js>(
                 return;
             };
             let is_call = matches!(message, BridgeMsg::Call { .. });
+            // Start mode: the host answers calls via deliver(); forward them
+            // to on_call and return (no dispatch, no engine answer). Execute
+            // mode has no on_call and calls dispatch below. Done/output
+            // messages always dispatch.
+            let forwarded = match (&message, shared.on_call.lock().unwrap().as_ref()) {
+                (
+                    BridgeMsg::Call {
+                        id,
+                        name,
+                        args_json,
+                    }
+                    | BridgeMsg::Global {
+                        id,
+                        name,
+                        args_json,
+                    },
+                    Some(on_call),
+                ) => {
+                    shared.record_issued(*id, name);
+                    let args: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
+                    on_call(HostCall {
+                        id: *id,
+                        target: if is_call {
+                            CallTarget::Tool
+                        } else {
+                            CallTarget::Global
+                        },
+                        name: name.clone(),
+                        args,
+                    });
+                    true
+                }
+                _ => false,
+            };
+            if forwarded {
+                return;
+            }
             match message {
                 BridgeMsg::Call {
                     id,
@@ -513,6 +588,7 @@ fn register_bridge<'js>(
                     writes,
                 } => {
                     shared.finished.store(true, Ordering::Relaxed);
+                    shared.decided.store(true, Ordering::Relaxed);
                     shared.tool_signal.cancel();
                     // Stored raw; assembled after the grace period so the
                     // calls snapshot includes cancelled entries.
@@ -537,6 +613,8 @@ async fn run_execute(
     // The whole VM lifecycle runs on a dedicated thread with a large stack
     // and its own single-threaded runtime; the caller just awaits the result.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<RunResult>();
+    let shared = Shared::new(&options.signal.clone().unwrap_or_default());
+    let run_signal = options.signal.clone().unwrap_or_default();
     std::thread::Builder::new()
         .name("codemode-vm".into())
         .stack_size(VM_THREAD_STACK)
@@ -545,7 +623,16 @@ async fn run_execute(
                 .enable_all()
                 .build()
                 .expect("vm runtime");
-            let result = rt.block_on(run_vm(script, sandbox, options));
+            let deadline_override = options.timeout_ms;
+            let result = rt.block_on(run_vm(
+                script,
+                sandbox,
+                shared,
+                run_signal,
+                deadline_override,
+                options.store.clone(),
+                None,
+            ));
             let _ = done_tx.send(result);
         })
         .expect("spawn codemode-vm");
@@ -574,12 +661,30 @@ fn shared_fail_static(kind: ErrorKind, message: &str) -> RunResult {
     }
 }
 
-async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions) -> RunResult {
-    let shared = Shared::new(&options.signal.clone().unwrap_or_default());
-    let run_signal = options.signal.clone().unwrap_or_default();
+/// Host-controlled run configuration (SPEC §5.0b mode 2): the determinism
+/// shim is enabled by this config's presence, and the JSON declarations
+/// (tools/globals/store) are prepared by the host.
+struct StartCfg {
+    tools_json: String,
+    globals_json: String,
+    store_json: String,
+}
 
+async fn run_vm(
+    script: String,
+    sandbox: SandboxOptions,
+    shared: Arc<Shared>,
+    signal: CancellationToken,
+    timeout_ms: Option<u64>,
+    store: BTreeMap<String, Value>,
+    start: Option<StartCfg>,
+) -> RunResult {
+    let run_signal = signal.clone();
     // Tool lookup: by canonical name or normalized js name (pi exposes both).
     let mut by_name: HashMap<String, Tool> = HashMap::new();
+    // Declarations: start mode uses the run's DECLARED tools (name + jsName
+    // only — the host answers calls); execute mode uses the sandbox's tool
+    // closures.
     let mut declarations: Vec<Value> = Vec::new();
     for tool in &sandbox.tools {
         let js_name = to_codemode_identifier(&tool.name);
@@ -607,11 +712,14 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
         global_declarations.push(json!({"name": global.name, "spread": global.spread}));
     }
 
-    let deadline = options
-        .timeout_ms
+    let deadline = timeout_ms
         .or(sandbox.timeout_ms)
         .map(|ms| Instant::now() + Duration::from_millis(ms));
-    let answers: AnswerQueue = Arc::new((AsyncMutex::new(VecDeque::new()), Notify::new()));
+    // One answer queue shared with the RunHandle: execute-mode dispatch
+    // answers flow through it, and start-mode deliveries notify the pump
+    // through it (VmRun::deliver pushes into `shared.held` and notifies this
+    // same Notify).
+    let answers: AnswerQueue = Arc::clone(&shared.answers);
 
     let runtime = AsyncRuntime::new().expect("rquickjs runtime");
     runtime
@@ -621,7 +729,7 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
         .set_max_stack_size(crate::fingerprint::MAX_STACK_SIZE)
         .await;
     {
-        let run_signal = run_signal.clone();
+        let run_signal = signal.clone();
         let shared = Arc::clone(&shared);
         runtime
             .set_interrupt_handler(Some(Box::new(move || {
@@ -644,10 +752,83 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
     // Setup, pump, and tick loop all run INSIDE one async_with: awaiting the
     // script's promise future drives the VM's job queue (v1's mechanism), and
     // the tick timeout detects a never-settling script (pi `stalled()`).
+    let is_start = start.is_some();
     let result: RunResult = ctx
         .async_with(async |vctx| {
-            // ---- setup: bridge, prelude, script; returns the script promise.
             let setup: Result<rquickjs::Promise, String> = (|| {
+                // Fingerprint precedes any call (§5.5).
+                if let Some(on_started) = shared.on_started.lock().unwrap().as_ref() {
+                    on_started(fingerprint(sandbox.memory_limit_bytes));
+                }
+                // The determinism shim: virtual clock Date/performance, seeded
+                // Math.random, no WeakRef/FinalizationRegistry, UTC-forced
+                // local-time methods. Runs BEFORE the prelude so the lockdown
+                // freezes the shimmed intrinsics.
+                if start.is_some() {
+                    let mut eval_opts = rquickjs::context::EvalOptions::default();
+                    eval_opts.filename = Some("codemode-determinism-shim.js".into());
+                    let (): () = vctx
+                        .eval_with_options(
+                            r#"(function () {
+							const RealDate = Date;
+							class ShimDate extends RealDate {
+								constructor(...args) {
+									if (args.length === 0) super(__pi_clock_now());
+									else super(...args);
+								}
+								static now() { return __pi_clock_now(); }
+							}
+							for (const [local, utc] of [
+								["getHours", "getUTCHours"], ["getMinutes", "getUTCMinutes"],
+								["getSeconds", "getUTCSeconds"], ["getMilliseconds", "getUTCMilliseconds"],
+								["getDate", "getUTCDate"], ["getDay", "getUTCDay"],
+								["getFullYear", "getUTCFullYear"], ["getMonth", "getUTCMonth"],
+							]) {
+								ShimDate.prototype[local] = RealDate.prototype[utc];
+							}
+							ShimDate.prototype.getTimezoneOffset = () => 0;
+							ShimDate.UTC = RealDate.UTC;
+							ShimDate.parse = RealDate.parse;
+							globalThis.Date = ShimDate;
+							globalThis.performance = { now: () => __pi_clock_elapsed() };
+							globalThis.Math.random = () => __pi_random();
+							globalThis.WeakRef = undefined;
+							globalThis.FinalizationRegistry = undefined;
+						})();"#,
+                            eval_opts,
+                        )
+                        .map_err(|e| format!("determinism shim failed: {e}"))?;
+                    let clock = Arc::clone(&shared.clock);
+                    let rng = Arc::clone(&shared.rng);
+                    vctx
+                        .globals()
+                        .set(
+                            "__pi_clock_now",
+                            rquickjs::function::Func::from(move || {
+                                clock.lock().unwrap().now() as f64
+                            }),
+                        )
+                        .map_err(|e| format!("shim native failed: {e}"))?;
+                    let clock = Arc::clone(&shared.clock);
+                    vctx
+                        .globals()
+                        .set(
+                            "__pi_clock_elapsed",
+                            rquickjs::function::Func::from(move || {
+                                clock.lock().unwrap().elapsed() as f64
+                            }),
+                        )
+                        .map_err(|e| format!("shim native failed: {e}"))?;
+                    let rng = Arc::clone(&rng);
+                    vctx
+                        .globals()
+                        .set(
+                            "__pi_random",
+                            rquickjs::function::Func::from(move || rng.lock().unwrap().next_f64()),
+                        )
+                        .map_err(|e| format!("shim native failed: {e}"))?;
+                }
+
                 let bridge = register_bridge(
                     &vctx,
                     Arc::clone(&shared),
@@ -661,19 +842,33 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                 let prelude_fn: rquickjs::Function = vctx
                     .eval_with_options(PRELUDE_SOURCE, eval_opts)
                     .map_err(|e| format!("prelude failed: {e}"))?;
-                let tools_json = json!(declarations).to_string();
-                let globals_json = json!(global_declarations).to_string();
+                let tools_json = start
+                    .as_ref()
+                    .map(|start| start.tools_json.clone())
+                    .unwrap_or_else(|| json!(declarations).to_string());
+                let globals_json = start
+                    .as_ref()
+                    .map(|start| start.globals_json.clone())
+                    .unwrap_or_else(|| json!(global_declarations).to_string());
                 // pi: storeJson is a snapshot of JSON TEXT — each value
                 // crosses as its JSON encoding, and the prelude parses on
-                // `load`.
-                let store_text: BTreeMap<&String, String> = options
-                    .store
-                    .iter()
-                    .map(|(k, v)| {
-                        (k, serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
-                    })
-                    .collect();
-                let store_json = json!(store_text).to_string();
+                // `load`. Start mode uses the host-prepared snapshot.
+                let store_json = start
+                    .as_ref()
+                    .map(|start| start.store_json.clone())
+                    .unwrap_or_else(|| {
+                        let store_text: BTreeMap<&String, String> = store
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k,
+                                    serde_json::to_string(v)
+                                        .unwrap_or_else(|_| "null".into()),
+                                )
+                            })
+                            .collect();
+                        json!(store_text).to_string()
+                    });
                 let api_obj: rquickjs::Object = prelude_fn
                     .call((bridge, tools_json, globals_json, store_json))
                     .map_err(|e| format!("prelude init failed: {e}"))?;
@@ -724,36 +919,79 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                 }
             });
 
-            // The pump: drain tool answers into the prelude's settle.
+            // The pump: settle answers in seq order. Execute mode: tool
+            // dispatch answers arrive through the queue; start mode: host
+            // deliveries arrive through `held` (seq-ordered; a gap waits for
+            // the missing number — pi: "after a gap it waits").
             let mut pump = Box::pin(async {
                 let (queue, notify) = &*answers;
                 loop {
-                    let mut guard = queue.lock().await;
-                    let answer = loop {
-                        if let Some(answer) = guard.pop_front() {
-                            break answer;
-                        }
-                        drop(guard);
-                        notify.notified().await;
-                        guard = queue.lock().await;
-                    };
-                    drop(guard);
-                    let Some(settle) = vctx
-                        .globals()
-                        .get::<_, rquickjs::Function>("__pi_settle")
-                        .ok()
-                    else {
-                        return;
-                    };
-                    let settled = match answer {
-                        Answer::Ok { id, payload } => {
-                            settle.call::<_, ()>((id as f64, true, payload, Undefined))
-                        }
-                        Answer::Err { id, message } => {
-                            settle.call::<_, ()>((id as f64, false, message, Undefined))
-                        }
-                    };
-                    let _ = settled;
+                    // Execute-mode queue answers settle immediately.
+                    let queue_answer = { queue.lock().await.pop_front() };
+                    if let Some(answer) = queue_answer {
+                        let Some(settle) = vctx
+                            .globals()
+                            .get::<_, rquickjs::Function>("__pi_settle")
+                            .ok()
+                        else {
+                            return;
+                        };
+                        let settled = match answer {
+                            Answer::Ok { id, payload } => {
+                                settle.call::<_, ()>((id as f64, true, payload, Undefined))
+                            }
+                            Answer::Err { id, message } => {
+                                settle.call::<_, ()>((id as f64, false, message, Undefined))
+                            }
+                        };
+                        let _ = settled;
+                        continue;
+                    }
+
+                    // Start mode: wait for deliveries; apply strictly in seq
+                    // order, advancing the clock while each result processes.
+                    if start.is_some() {
+                        let next = shared.next_seq.load(Ordering::Relaxed);
+                        let held_entry = shared.held.lock().unwrap().get(&next).cloned();
+                        let Some((now, id, outcome)) = held_entry else {
+                            notify.notified().await;
+                            continue;
+                        };
+                        shared.last_settled_seq.store(next, Ordering::Relaxed);
+                        shared.clock.lock().unwrap().advance_to(now);
+                        let Some(settle) = vctx
+                            .globals()
+                            .get::<_, rquickjs::Function>("__pi_settle")
+                            .ok()
+                        else {
+                            return;
+                        };
+                        let settled = match outcome {
+                            Outcome::Ok(value) => {
+                                let payload = serde_json::to_string(&value)
+                                    .unwrap_or_else(|_| "null".into());
+                                settle.call::<_, ()>((id as f64, true, payload, Undefined))
+                            }
+                            Outcome::Err { message, properties } => {
+                                let props_json = properties
+                                    .as_ref()
+                                    .map(|props| serde_json::to_string(props).unwrap())
+                                    .unwrap_or_else(|| "undefined".into());
+                                settle.call::<_, ()>((
+                                    id as f64,
+                                    false,
+                                    message,
+                                    props_json,
+                                ))
+                            }
+                        };
+                        let _ = settled;
+                        shared.next_seq.store(next + 1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    // Execute mode: nothing queued — wait.
+                    notify.notified().await;
                 }
             });
 
@@ -794,12 +1032,14 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                             Ok(_) => String::new(),
                         };
                         if shared.deadline_hit.load(Ordering::Relaxed) {
-                            let fail = shared.fail(ErrorKind::Timeout, "the deadline expired");
+                            let fail =
+                                shared.fail(ErrorKind::Timeout, "the deadline expired");
                             *shared.fail_result.lock().unwrap() = Some(fail);
                             break None;
                         }
                         if shared.abort_hit.load(Ordering::Relaxed) {
-                            let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
+                            let fail =
+                                shared.fail(ErrorKind::Aborted, "the run was aborted");
                             *shared.fail_result.lock().unwrap() = Some(fail);
                             break None;
                         }
@@ -829,7 +1069,17 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                         break None;
                     }
                     _ = tokio::time::sleep(tick) => {
-                        // Idle tick: no progress in 25 ms.
+                        // Idle tick: no progress in 25 ms. Fire onIdle while
+                        // calls wait (pi: onIdle per drain).
+                        if is_start
+                            && !shared.outstanding.lock().unwrap().is_empty()
+                            && let Some(on_idle) = shared.on_idle.lock().unwrap().as_ref()
+                        {
+                            on_idle(
+                                shared.last_settled_seq.load(Ordering::Relaxed),
+                                shared.issued.load(Ordering::Relaxed),
+                            );
+                        }
                         if shared.finished.load(Ordering::Relaxed)
                             && let Some(parts) = shared.done_parts.lock().unwrap().take()
                         {
@@ -861,7 +1111,7 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             shared.cancel_outstanding();
-            match done_parts {
+            let mut vm_result = match done_parts {
                 Some((ok, payload, writes)) => shared.assemble(ok, payload, writes),
                 None => match shared.fail_result.lock().unwrap().take() {
                     Some(fail) => fail,
@@ -870,7 +1120,15 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
                         "script waits on a promise that can never settle (no timers; no tool call pending)",
                     ),
                 },
+            };
+            // Start runs always report `during` (pi: "0 for its first run").
+            if is_start {
+                vm_result.during = Some(During {
+                    seq: shared.last_settled_seq.load(Ordering::Relaxed),
+                    issued: shared.issued.load(Ordering::Relaxed),
+                });
             }
+            vm_result
         })
         .await;
     shared.cancel_outstanding();
@@ -879,45 +1137,157 @@ async fn run_vm(script: String, sandbox: SandboxOptions, options: ExecuteOptions
 
 // ------------------------------------------------------------- start mode ---
 
-fn run_start(
-    _script: String,
-    _sandbox: SandboxOptions,
-    _options: RunOptions,
-) -> Box<dyn RunHandle> {
-    // Lands with the deterministic phase (SPEC §11.5 step 3); the stub keeps
-    // the trait honest until the ported deterministic tests drive it.
-    Box::new(StubRun)
+fn run_start(script: String, sandbox: SandboxOptions, options: RunOptions) -> Box<dyn RunHandle> {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<RunResult>();
+    let shared = Shared::new(&options.signal.clone().unwrap_or_default());
+    let vm_shared = Arc::clone(&shared);
+    // Deterministic state: the virtual clock starts at `started_at`; the PRNG
+    // seeds from `seed ^ 0x9e3779b9` (pi seeds its WASI prng with the same
+    // XOR of the golden ratio).
+    {
+        *shared.clock.lock().unwrap() = VirtualClock::new(options.started_at);
+        *shared.rng.lock().unwrap() = Mulberry32::new(options.seed ^ 0x9e3779b9);
+    }
+    let options_on_call = options.on_call;
+    {
+        let mut on_call = shared.on_call.lock().unwrap();
+        *on_call = Some(Box::new(move |call: HostCall| {
+            (options_on_call)(call);
+        }));
+    }
+    if let Some(on_started) = options.on_started {
+        *shared.on_started.lock().unwrap() = Some(on_started);
+    }
+    if let Some(on_idle) = options.on_idle {
+        *shared.on_idle.lock().unwrap() = Some(on_idle);
+    }
+
+    let tools_json = json!(options
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "jsName": tool.js_name.clone().unwrap_or_else(|| to_codemode_identifier(&tool.name)),
+                "description": tool.description.clone().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>())
+    .to_string();
+    let globals_json = json!(
+        options
+            .globals
+            .iter()
+            .map(|global| json!({"name": global.name, "spread": global.spread}))
+            .collect::<Vec<_>>()
+    )
+    .to_string();
+    let store_json = json!(
+        options
+            .store
+            .iter()
+            .map(|(k, v)| (
+                k.clone(),
+                serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+            ))
+            .collect::<BTreeMap<_, _>>()
+    )
+    .to_string();
+    let store: BTreeMap<String, Value> = options
+        .store
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let vm_signal = options.signal.clone().unwrap_or_default();
+    let vm_timeout = options.timeout_ms;
+
+    std::thread::Builder::new()
+        .name("codemode-vm".into())
+        .stack_size(VM_THREAD_STACK)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("vm runtime");
+            let result = rt.block_on(run_vm(
+                script,
+                sandbox,
+                vm_shared,
+                vm_signal,
+                vm_timeout,
+                store,
+                Some(StartCfg {
+                    tools_json,
+                    globals_json,
+                    store_json,
+                }),
+            ));
+            let _ = done_tx.send(result);
+        })
+        .expect("spawn codemode-vm");
+
+    Box::new(VmRun {
+        shared: Arc::clone(&shared),
+        done_rx: Mutex::new(Some(done_rx)),
+    })
+}
+/// A running [`Engine::start`] execution. (pi: `CodemodeRun`.)
+struct VmRun {
+    shared: Arc<Shared>,
+    done_rx: Mutex<Option<tokio::sync::oneshot::Receiver<RunResult>>>,
 }
 
-struct StubRun;
-impl RunHandle for StubRun {
+impl RunHandle for VmRun {
     fn result(&mut self) -> BoxFuture<'_, RunResult> {
-        async {
-            RunResult {
-                outcome: Err(ScriptError {
-                    kind: ErrorKind::Sandbox,
-                    name: None,
-                    message: "start() lands with the deterministic phase".into(),
-                    stack: None,
-                }),
-                output: vec![],
-                calls: vec![],
-                during: None,
+        let shared = Arc::clone(&self.shared);
+        let done_rx = self.done_rx.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(done_rx) = done_rx
+                && let Ok(result) = done_rx.await
+            {
+                return result;
             }
-        }
-        .boxed()
+            shared.fail(
+                ErrorKind::Sandbox,
+                "the VM ended without reporting a result",
+            )
+        })
     }
+
+    /// Whether the run has its outcome: decided before `result` settles, and
+    /// stays decided after the parts are consumed (pi: "is finished once it
+    /// has its outcome").
     fn finished(&self) -> bool {
-        true
+        self.shared.decided.load(Ordering::Relaxed)
+            || self.shared.done_parts.lock().unwrap().is_some()
+            || self.shared.fail_result.lock().unwrap().is_some()
     }
-    fn deliver(
-        &self,
-        _seq: u64,
-        _now: u64,
-        _id: u64,
-        _outcome: Outcome,
-    ) -> Result<(), DeliverError> {
-        Err(DeliverError::NotWaiting)
+
+    /// Answer call `id` as result number `seq`. Results apply strictly in seq
+    /// order, whatever order they arrive in; while one is processed the clock
+    /// reads `now`, or the previous value if `now` is earlier. A finished run
+    /// accepts deliveries as no-ops (pi: after abort, deliver does not
+    /// throw).
+    fn deliver(&self, seq: u64, now: u64, id: u64, outcome: Outcome) -> Result<(), DeliverError> {
+        // A finished run: the VM is gone; deliveries are no-ops (pi: does not
+        // throw after the caller aborts).
+        if self.finished() {
+            return Ok(());
+        }
+        let mut held = self.shared.held.lock().unwrap();
+        // The call must be waiting (pi: "Call 99 is not waiting").
+        if !self.shared.outstanding.lock().unwrap().contains_key(&id) {
+            return Err(DeliverError::NotWaiting);
+        }
+        // The result number must not be reused (pi: "used once").
+        let next_seq = self.shared.next_seq.load(Ordering::Relaxed);
+        if seq < next_seq || held.contains_key(&seq) {
+            return Err(DeliverError::SeqUsed);
+        }
+        held.insert(seq, (now, id, outcome));
+        drop(held);
+        self.shared.answers.1.notify_one();
+        Ok(())
     }
 }
 
