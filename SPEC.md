@@ -197,24 +197,40 @@ The codemode tool's description carries the catalog (D9):
 - Exposure-aware listing: `Mode::On` lists non-direct tools; `Mode::Only` lists
   all (v1 `catalog.rs:148-159`; pi `tool.ts:360-366`).
 
-### 7.1 Deferred tools (REALIGN — was mis-stated in v1)
+### 7.1 Deferred & dynamic upstreams (pi-exact — RESOLVED, OQ3)
 
-pi's deferred semantics: deferred tools are **never listed** and do not affect the
-description at all, so the description stays byte-stable while tools register late
-(*"for example by MCP servers that connect"* — `tool.ts:229-231`); discovery is via
-`ALL_TOOLS` / `searchTools`. Codex carries the same concept
-(`DEFERRED_NESTED_TOOLS_GUIDANCE`). v1's `Exposure::Deferred` **is listed** in
-`Mode::On` — a mismatch to fix.
+Verified against pi's MCP extension (`extensions/mcp/index.ts`); this corrects
+the earlier "startup snapshot catalog" framing, which was wrong for upstream
+tools:
 
-v2 must define the listing policy per `Exposure × Mode` and the behavior under
-dynamic upstreams (**OQ3**):
+1. **Upstream MCP tools never enter the codemode description catalog.** With
+   the default `codemode` exposure, MCP tools are kept "out of the model's
+   tool declarations and the codemode description: scripts find the tools
+   with `searchTools()` and the server instructions with `describeNamespace()`"
+   (`index.ts:9-12`, default at `:137`). The budgeted "Nested tools:" catalog
+   is for native/direct tools only — for a pure upstream router it is empty.
+2. **The server list lives in the system prompt**, in an `mcp_servers` section
+   (`:156`): one line per server — `mcp__<server> (codemode): <summary>` —
+   summaries ≤250 chars (`:159`), section ≤4,096 chars (`:164`), servers
+   sorted by name, overflow collapsed to "… N more servers; find their tools
+   with `searchTools()`" (`renderServersSection`, `:186-218`).
+3. **Late connection**: per-prompt re-render; when the section changed (e.g. a
+   server connected), the updated section is appended to the conversation
+   (`:1176-1183`). The codemode tool itself is never redeclared for upstream
+   changes. Servers with only codemode tools connect in the background; the
+   first prompt waits only for `direct`-tool servers (`:7-8`).
+4. **Discovery**: `searchTools()` ranks the live catalog; `describeNamespace`
+   returns a server's instructions; calls to a disconnected server's tools
+   fail with a clean error. Disconnects surface as section updates at the
+   next prompt.
+5. **Per-server exposure config** (pi `:120`): `direct` (declared natively,
+   excluded from the catalog in `on` mode), `codemode` (default), `deferred`
+   (loaded by tool_search, then called directly — this is the set the
+   description's `deferred` parameter excludes, `tool.ts:389-395`), `hidden`.
 
-- Does a late-connecting upstream's tools start deferred and get promoted?
-- On upstream disconnect, are its listed sections withdrawn (description changes)
-  or marked unavailable?
-- MCP has `tools/list_changed`: pi chose byte-stability for prompt-cache
-  friendliness without a change-notification channel; an MCP router *has* one.
-  Byte-stability vs redeclare-on-change is the core of **OQ3**.
+Consequence for the router: no byte-stability requirement on the codemode
+description (upstream changes never touch it); the only dynamic surface is the
+system-prompt `mcp_servers` section, which hosts already re-render per prompt.
 
 ## 8. Naming & upstream ingestion
 
@@ -329,7 +345,7 @@ formatting) carry over — as reference, not as authority.
 |---|---|---|
 | OQ1 | ~~v1 disposition~~ **RESOLVED** | **clean rewrite from this spec**, oracle-first: the ported pi suite (§11.1) is written before the engine that must pass it. v1 stays on main as reference material (QuickJS workarounds, verified fixes) until v2 passes the ported oracle suite, then archived; v1's hand-written tests are not ported (§11.4) |
 | OQ2 | ~~Crate split~~ **RESOLVED** | keep v1's two crates (core contracts / quickjs engine + server handler); revisit only if the server layer grows worth independent release |
-| OQ3 | Deferred listing policy + description stability | deferred-by-default for upstreams; promotion policy; byte-stability vs `tools/list_changed` redeclare |
+| OQ3 | ~~Deferred listing policy~~ **RESOLVED — pi-exact** | upstream MCP tools never listed in the description (default `codemode` exposure); server list = system-prompt `mcp_servers` section (≤4,096 chars, ≤250/server), re-rendered per prompt, appended on change; discovery via `searchTools` + `describeNamespace`; codemode tool never redeclared for upstream changes; per-server exposure config `direct/codemode/deferred/hidden` (§7.1) |
 | OQ4 | Name normalization | charset rules for server/tool names → JS identifiers; normalized-name collision policy |
 | OQ5 | Fingerprint composition | which hashes/versions enter the string; where it lives in `SuspendState` |
 | OQ6 | searchTools layer placement | bindings layer (v1) vs host/extension layer (pi's split) |
