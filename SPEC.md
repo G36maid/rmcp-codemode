@@ -74,6 +74,7 @@ Key reads that shaped decisions:
 | D10 | Budget constants | pi-aligned (§5.2) | LOCKED | pi `execute.ts:52,306-307`; v1 `Budget::default()` matches |
 | D11 | Determinism | virtual clock (advances only on delivered outcomes, never backward) + seeded mulberry32; WeakRef/FinalizationRegistry removed | LOCKED | pi `vm.ts:83-103`; `protocol.ts:24` |
 | D12 | MCP protocol baseline | spec **2025-11-25** + the Final SEPs we rely on (§10.1); `_meta` keys use reverse-DNS prefix `io.github.g36maid/` (v1's `codemode/storeDomain` violates the SHOULD and is renamed); tool naming complies with SEP-986; Tasks extension tracked as the future wire vehicle (D5) | LOCKED | verified against modelcontextprotocol.io 2026-11 |
+| D13 | Upstream aggregation semantics | **pi-exact** (§8.2): tools + resources-as-tools (no prompts); `isError` resolves to scripts (model-facing output marked), v1's Err-rejection dropped; annotation hints forwarded, icons/`_meta` stripped; minimal client capabilities; truncated output saved with `fullOutputPath`; auth = embedder's boundary (crate consumes connected peers) | LOCKED | pi `tools.ts:8-10,135-232,275-278`; `resources.ts:53-55`; `index.ts:387`; verified 2026-11 |
 
 ## 4. Architecture — crate layering
 
@@ -260,9 +261,39 @@ layer):
 
 ### 8.2 Ingestion
 
-- Ingestion reuses v1's `space_from_peer` / `upstream_into_space`: handshake
-  `instructions` auto-attached, unwrap order (structuredContent → first text
-  block JSON → raw text), `isError` → `Err` carrying text.
+### 8.2 Ingestion & result conversion (pi-exact — RESOLVED, D13)
+
+- **Scope**: tools **and resources-as-tools** aggregate into the Space
+  (resources become callable tools participating in codemode/`searchTools`;
+  read resources convert to text/images for the model). **Prompts do not
+  aggregate.** Tolerated: servers without the `tools` capability (prompts- or
+  resources-only) contribute no tool entries (pi `index.ts:387`).
+- **Result conversion** (pi `convertMcpResult`, `tools.ts:215-232`): content
+  blocks and `structuredContent` are both preserved; the result's `_meta` is
+  stripped; truncated output is saved with `fullOutputPath` reported; content
+  blocks and `structuredContent` are both preserved; **`isError` resolves —
+  scripts receive the full result; only the model-facing output is marked
+  `isError: true`** (pi `tools.ts:8-10`: *"MCP errors are error results for
+  the model, but scripts still resolve to the result"*). When `isError` and
+  the text is empty, a synthesized `MCP tool <server>/<tool> returned an
+  error` line is appended. v1's `isError → Err` rejection semantics are
+  dropped. (Distinct path, unchanged: **host-delivered** `Err` answers reject
+  the script's promise — pi `deterministic.test.ts:209`.)
+- Tolerant `structuredContent`: servers may send it without a declared schema
+  and it may be any JSON value (pi `tools.ts:140-143`).
+- **Annotations**: the four boolean hints `readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint` are forwarded (`tools.ts`
+  `ANNOTATION_HINTS`/`toToolAnnotations`); **icons and entry `_meta` are
+  stripped** (`resources.ts:53-55`).
+- **Client capabilities**: minimal — no sampling/roots/elicitation declared
+  toward upstreams (pi declares none in its MCP extension); servers that
+  require sampling are refused by the server and simply unusable — documented,
+  not worked around.
+- Handshake `instructions` auto-attach (v1 behavior, kept).
+- **Auth boundary**: the crate consumes **connected peers**; transport and
+  OAuth belong to the embedder (pi implements OAuth itself only because it is
+  the host opening its own transports — a form-factor difference, not
+  semantics).
 
 ### 8.3 Upstream lifecycle (pi policy verified, `docs/mcp.md:100` — OQ7 largely resolved)
 
@@ -275,6 +306,9 @@ layer):
 - HTTP network errors and transient statuses (408, 429, 5xx) retry **twice**;
   a dropped connection reconnects on the next call.
 - A changed tool list: new tools added, withdrawn tools become unreachable.
+- **Cancellation**: the embedder's abort signal propagates into every upstream
+  call (pi `tools.ts:275-278` passes `signal` per call); cancelling a codemode
+  run aborts its in-flight upstream calls and frees the worker slot.
 - Library API shape (Rust-side) is the remaining sliver of OQ7.
 
 ## 9. Native tools (embedder's right)
