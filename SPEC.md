@@ -118,9 +118,17 @@ Layering rules:
 - **Worker pool** (run-level): default 2 slots, arrival order, admission failure
   *before* the VM starts, wait counted against the deadline, pi's exact admission
   failure message. Worker-pool wait and deadline interact as `min(deadline, wait)`.
-- **In-flight call limiter** (call-level): pi caps concurrent in-flight nested
-  calls separately from run slots (`execute.ts:265-270`). v1 lacks this layer —
-  **OQ9**.
+- **No in-flight call limiter** (RESOLVED, OQ9 — pi-exact): nested calls are
+  unlimited within a run, bounded only by `max_tool_calls` and the deadline —
+  pi's engine has no concurrency cap on nested calls either (the prelude
+  bridge settles each call as it lands); pi's only `createLimiter`
+  (`execute.ts:50,265-270,750`, `MAX_CONCURRENT_MODEL_CALLS = 4`) guards
+  `models`-namespace sub-model calls, a host-specific surface ours does not
+  have. Fan-out pressure is the **upstreams'** problem (MCP servers own their
+  concurrency) and the embedder's (transport-level connection pools). An
+  optional `Budget.max_in_flight_calls` remains an **additive** future knob:
+  it is script-invisible (all calls still complete, records stay in issue
+  order, virtual clock unaffected), so adding it later breaks nothing.
 
 ### 5.2 Budgets (defaults LOCKED, D10)
 
@@ -481,4 +489,4 @@ formatting) carry over — as reference, not as authority.
 | OQ6 | ~~searchTools layer placement~~ **RESOLVED — pi-exact (B)** | engine provides only the generic host-globals mechanism (grouping/spreading/numbering); searchTools/describeTool/describeNamespace are router-layer registrations over the Space index; engine core keeps only `ALL_TOOLS` (§6.1, §6.2) |
 | OQ7 | Upstream lifecycle API | **policy resolved** (pi `docs/mcp.md:100`: background connect, 10 s direct-wait, on-demand waits, retry 408/429/5xx ×2, reconnect on next call, tool-list change = add/unreachable — §8.3); remaining: Rust API shape |
 | OQ8 | ~~codex-only globals~~ **RESOLVED — all three rejected** | `notify()` (no transport, tied to rejected lifecycle), `setTimeout` (breaks determinism / no-op on virtual clock), `generatedImage` (subsumed by `image()`); principle: script surface = pi + adopted OC behaviors (§6.2) |
-| OQ9 | In-flight call limiter | adopt pi's second limiter layer; default limit |
+| OQ9 | ~~In-flight call limiter~~ **RESOLVED — none, pi-exact** | nested calls unlimited within a run; premise corrected: pi's `createLimiter` guards model calls only, not nested calls (§5.1); upstream pressure belongs to upstreams/embedders; `Budget.max_in_flight_calls` stays an additive future option (script-invisible) |
