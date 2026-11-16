@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-codemode"
-description = "The engine-agnostic codemode core: tool space, script contract, catalog, and engine traits"
+description = "The engine-agnostic codemode core: contract types and engine trait, mirroring pi's codemode API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,14 +10,19 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rmcp = { version = "3.9", default-features = false, features = ["client", "server"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-futures = "0.3"
-thiserror = "2"
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 
-[lints]
-workspace = true
+[lints.clippy]
+# Frozen mirror exception (D14, user-approved): this crate's public types are
+# a 1:1 contract mirror of pi's types.ts - construction literals and
+# exhaustive matches are the intended downstream usage, and type changes
+# follow pi upstream as deliberate major events guarded by the ported
+# oracle suite. The workspace's exhaustive_* lints do not apply here.
+exhaustive_structs = "allow"
+exhaustive_enums = "allow"

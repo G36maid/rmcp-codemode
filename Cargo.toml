@@ -1,10 +1,9 @@
 [workspace]
-members = ["crates/rmcp-codemode", "crates/rmcp-codemode-quickjs", "examples/codemode-demo"]
+members = ["crates/rmcp-codemode"]
 resolver = "3"
 
 [workspace.dependencies]
 rmcp-codemode = { version = "0.2.0", path = "./crates/rmcp-codemode" }
-rmcp-codemode-quickjs = { version = "0.2.0", path = "./crates/rmcp-codemode-quickjs" }
 
 [workspace.package]
 edition = "2024"
