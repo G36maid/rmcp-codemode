@@ -1,14 +1,15 @@
 //! The script-surface prelude, ported verbatim from pi
-//! (`packages/codemode/src/runtime/prelude-source.ts`; the `${...}` template
-//! interpolations are substituted with pi's concrete values: store caps
-//! 262144/1048576, output caps 16777216/100000, and the JSON-quoted
-//! IMAGE_HELPER_EXPECTS). Semantics are pi's own JS - see the original file
-//! for the lockdown, guard proxy, store, image, and error-formatting
-//! contracts. The bridge protocol: `bridge(kind, a, b, c)` with kind
-//! "call"/"global" (id, name, argsJson), "output" ("text"|"console", text) or
-//! ("image", data, mimeType), "done" (ok, payloadJson, writesJson); the host
-//! answers via `settle(id, ok, payload, propertiesJson)`; `run(fn)` starts the
-//! script; `stalled()` detects a never-settling wait.
+//! (`packages/codemode/src/runtime/prelude-source.ts`; TS template escapes
+//! are unescaped and the `${...}` interpolations substituted with pi's
+//! concrete values: store caps 262144/1048576, output caps 16777216/100000,
+//! and the JSON-quoted IMAGE_HELPER_EXPECTS). Semantics are pi's own JS - see
+//! the original file for the lockdown, guard proxy, store, image, and
+//! error-formatting contracts. The bridge protocol: `bridge(kind, a, b, c)`
+//! with kind "call"/"global" (id, name, argsJson), "output"
+//! ("text"|"console", text) or ("image", data, mimeType), "done" (ok,
+//! payloadJson, writesJson); the host answers via `settle(id, ok, payload,
+//! propertiesJson)`; `run(fn)` starts the script; `stalled()` detects a
+//! never-settling wait.
 
 pub const PRELUDE_SOURCE: &str = r##"(function (bridge, toolsJson, globalsJson, storeJson) {
 	"use strict";
@@ -130,11 +131,9 @@ pub const PRELUDE_SOURCE: &str = r##"(function (bridge, toolsJson, globalsJson, 
 		const head = error.message ? error.name + ": " + error.message : String(error.name);
 		const frames =
 			typeof error.stack === "string"
-				? error.stack.split("\
-").filter((line) => line.trim() && !line.includes("codemode-prelude.js"))
+				? error.stack.split("\n").filter((line) => line.trim() && !line.includes("codemode-prelude.js"))
 				: [];
-		return [head, ...frames].join("\
-");
+		return [head, ...frames].join("\n");
 	}
 
 	function format(value) {
@@ -194,7 +193,7 @@ pub const PRELUDE_SOURCE: &str = r##"(function (bridge, toolsJson, globalsJson, 
 	Object.freeze(allTools);
 
 	// Reading a member that does not exist throws an error that names the close matches, instead of
-	// a later "not a function". \`in\` checks still work.
+	// a later "not a function". `in` checks still work.
 	const comparable = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
 	function guard(target, label, names, hint) {
 		return new Proxy(target, {
@@ -385,7 +384,7 @@ pub const PRELUDE_SOURCE: &str = r##"(function (bridge, toolsJson, globalsJson, 
 		// Providers reject the whole request on a bad image, and a persisted image block would be
 		// resent on every later turn. Line breaks from wrapped base64 are dropped. The declared type
 		// is ignored in favor of the detected one, as providers also reject mismatches.
-		const data = url.slice(comma + 1).replace(/\\s+/g, "");
+		const data = url.slice(comma + 1).replace(/\s+/g, "");
 		if (data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
 			throw new TypeErrorCtor("invalid image output. The image data is not valid base64 (truncated or corrupted?)");
 		}
@@ -494,5 +493,7 @@ pub const PRELUDE_SOURCE: &str = r##"(function (bridge, toolsJson, globalsJson, 
 })"##;
 /// The `run(fn)` wrapper pi uses (`vm.ts:326-327`): the prefix shares its
 /// first line with the script so reported line numbers match the script as
-/// written.
+/// written. Port addition (documented): `run` returns the script's promise so
+/// the host can await it to drive the VM's job queue; pi's worker transport
+/// does not need this.
 pub const SCRIPT_WRAPPER_PREFIX: &str = "(async (tools, console) => {";
