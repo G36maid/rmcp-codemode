@@ -216,7 +216,7 @@ pub(crate) fn setup(
                 }
                 counter.fetch_add(1, Ordering::Relaxed);
                 let started = std::time::Instant::now();
-                let response = search_tools_response(&space, &namespaces, &query, &opts_json);
+                let response = search_tools_response(&space, &namespaces, &query, &opts_json, budget.default_search_limit);
                 calls.lock().unwrap().push(rmcp_codemode::CallRecord::finished(
                     "searchTools",
                     rmcp_codemode::CallStatus::Ok,
@@ -402,13 +402,14 @@ fn search_tools_response(
     namespaces: &BTreeMap<String, NamespaceMeta>,
     query: &str,
     opts_json: &str,
+    default_limit: usize,
 ) -> String {
     let options: Value = serde_json::from_str(opts_json).unwrap_or(json!({}));
     let limit = options
         .get("limit")
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(8);
+        .unwrap_or(default_limit.max(1));
     let offset = options
         .get("offset")
         .and_then(Value::as_u64)

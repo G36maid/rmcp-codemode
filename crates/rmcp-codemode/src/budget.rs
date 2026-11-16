@@ -27,6 +27,10 @@ pub struct Budget {
     /// Hard cap on tool calls one script may make. Default: 500.
     /// `None` means unlimited (OpenCode: `maxToolCalls`, absent = unlimited).
     pub max_tool_calls: Option<usize>,
+    /// How many results `searchTools` returns when the script passes no
+    /// `limit` option (pi's default is 8; OpenCode's is 10). The script's
+    /// explicit `limit` always wins.
+    pub default_search_limit: usize,
     /// VM heap limit in bytes. Default: 256 MiB (pi's cap).
     pub memory_limit: usize,
     /// How many runs may execute at once; further runs queue in arrival
@@ -48,6 +52,7 @@ impl Default for Budget {
             max_output_items: 100_000,
             max_output_chars: 16 * 1024 * 1024,
             max_tool_calls: Some(500),
+            default_search_limit: 8,
             memory_limit: 256 * 1024 * 1024,
             max_workers: 2,
             worker_wait_ms: 60_000,
@@ -87,6 +92,12 @@ impl Budget {
     /// The default budget with one field overridden.
     pub fn with_max_tool_calls(mut self, calls: usize) -> Self {
         self.max_tool_calls = Some(calls);
+        self
+    }
+
+    /// The default budget with one field overridden.
+    pub fn with_default_search_limit(mut self, limit: usize) -> Self {
+        self.default_search_limit = limit;
         self
     }
 
