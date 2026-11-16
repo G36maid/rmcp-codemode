@@ -456,9 +456,15 @@ Inventory:
 | `sandbox.test.ts` | 55 | script execution, output order, exit()/partial-output-on-failure, **V8-style stacks without prelude frames**, line-numbered errors, non-Error throws, tools (records, concurrency, normalized identifiers, unawaited-call aborts, close-match naming), store (snapshot+writes, copies, in-script oversized rejection), globals (namespaced, **argument spreading**, reserved-name rejection), limits (**uncatchable abort error**, never-settling promise, output limits hold even when caught, parallel runs share nothing), escape hatches (no host globals, eval/Function caged, dynamic import rejected, built-in patches ignored) |
 | `deterministic.test.ts` | 24 | same calls/output for same start/seed/results; UTC regardless of host tz; **results applied in seq order regardless of delivery order**; **fingerprint before first call**; **clock monotonic + rejects non-finite delivered `now_ms`**; unserializable answers leave the call waiting; abort = uncatchable; double-delivery rejected |
 | `declarations.test.ts` | 19 | `schemaToType`: budget→unknown, draft-04 constraints, `$ref` resolution with recursion stop, arrays/tuples — the description catalog's declaration renderer |
-| `portable.test.ts` | 7 | port with adaptation notes |
-| `worker-lifetime.test.ts` | 7 | TS-worker specifics — likely `N/A` (Rust threading differs); document per-case |
-| `source.test.ts` | 5 | embedded sources parse; port |
+| `portable.test.ts` | 7 | 2 applicable (InlineCodemodeSandbox interrupt budget → `SandboxOptions.interrupt_budget`, ported); 5 `N/A` (RemoteCodemodeSandbox = Workers-RPC transport, out of scope per D2/D14) |
+| `worker-lifetime.test.ts` | 7 | `N/A` — each execution runs on a dedicated VM thread dropped when the run settles (D3); no persistent worker to dispose; dispose/abort coverage lives in the sandbox suite |
+| `source.test.ts` | 5 | embedded sources parse; ported (`source.rs`, host-side before `run`) |
+
+Port status (v2): sandbox 33 green, deterministic 10, declarations 19,
+source 6 (5 pi cases + error-type assertion), portable 2 — workspace 77
+green. The stalled-detection port fixed a real divergence: pi detects a
+never-settling script synchronously per drain (`vm.ts:243-250`, prelude
+`stalled()` checking `pending.size`), not by a wall-clock idle timer.
 
 Known v1 gaps already legible from test names (to be confirmed by the port):
 V8-style stack formatting, uncatchable abort errors, non-finite clock-value
@@ -495,9 +501,9 @@ formatting) carry over — as reference, not as authority.
    prelude/bindings written as clean JS source + hash (pi's
    `prelude-source.ts` shape), not Rust format strings.
 3. Port `deterministic.test.ts` (24), then `declarations.test.ts` (19 — full
-   `schemaToType` renderer).
+   `schemaToType` renderer). ✅
 4. Port `portable`/`source`; document `worker-lifetime` cases `N/A` with
-   reasons where Rust threading differs.
+   reasons where Rust threading differs. ✅ (§11 inventory)
 5. Port OC's four suites (§11.3).
 6. Upstream ingestion + naming (§8), catalog description (§7), server handler
    (§10) with real-MCP fixtures (§11.2).
