@@ -7,10 +7,15 @@
 //! discovery globals, upstream ingestion) live at the server layer (SPEC
 //! §4, D14).
 
+pub mod declarations;
 pub mod engine;
 pub mod naming;
 pub mod types;
 
+pub use declarations::{
+    DEFAULT_INPUT_SCHEMA_MAX_CHARS, Declarations, render_declarations, render_tool_output_type,
+    render_tool_sample, render_tool_signature, resolve_schema_ref, schema_to_type,
+};
 pub use engine::{Engine, RunHandle};
 pub use types::{
     Call, CallStatus, CallTarget, DeclaredGlobal, DeclaredTool, DeliverError, During, ErrorKind,
