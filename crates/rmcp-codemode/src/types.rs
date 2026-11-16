@@ -252,6 +252,13 @@ pub struct SandboxOptions {
     /// Overall deadline per execution, including time in tools. `None`
     /// disables it; the run ends only when the script settles or is aborted.
     pub timeout_ms: Option<u64>,
+    /// Poll budget: the VM fails the run as `timeout` once the engine's
+    /// interrupt handler has polled this often, counting across awaits on
+    /// tools — a script that computes forever never settles. `None` = no
+    /// budget (pi: `InlineSandboxOptions.interruptBudget`, default
+    /// `DEFAULT_INTERRUPT_BUDGET = 100_000`; kept out of pi's contract
+    /// `types.ts` — it is a sandbox-construction knob).
+    pub interrupt_budget: Option<u64>,
     /// Maximum memory the VM may allocate; beyond it fails inside the script
     /// as `InternalError: out of memory`.
     pub memory_limit_bytes: Option<u64>,

@@ -151,6 +151,10 @@ struct Shared {
     /// script error the interruption surfaces as).
     deadline_hit: AtomicBool,
     abort_hit: AtomicBool,
+    /// Set by the interrupt handler once the poll budget is exhausted; the
+    /// script then rejects and the tick loop classifies the rejection as
+    /// `timeout` with pi's message (pi inline.ts:94).
+    budget_message: Mutex<Option<String>>,
     /// Cancels in-flight tool futures when the script ends or the run stops.
     tool_signal: CancellationToken,
     /// The bridge's `done` parts, stored raw; assembled into the final
@@ -193,6 +197,7 @@ impl Shared {
             finished: AtomicBool::new(false),
             deadline_hit: AtomicBool::new(false),
             abort_hit: AtomicBool::new(false),
+            budget_message: Mutex::new(None),
             // Child of the run signal: caller aborts propagate; `done`
             // cancels this to stop unawaited tools (pi: "aborts unawaited
             // calls when the script returns").
@@ -731,6 +736,9 @@ async fn run_vm(
     {
         let run_signal = signal.clone();
         let shared = Arc::clone(&shared);
+        // pi inline.ts: the interrupt budget counts handler polls and never
+        // resets, so it accumulates across waits on tools.
+        let budget_polls = Arc::new(AtomicU64::new(0));
         runtime
             .set_interrupt_handler(Some(Box::new(move || {
                 if run_signal.is_cancelled() {
@@ -740,6 +748,20 @@ async fn run_vm(
                 if deadline.is_some_and(|d| Instant::now() >= d) {
                     shared.deadline_hit.store(true, Ordering::Relaxed);
                     return true;
+                }
+                // pi inline.ts:79-94: `if (++polls <= interruptBudget) return false;`
+                // else fail with `Execution exceeded its interrupt budget of N`.
+                if let Some(budget) = sandbox.interrupt_budget {
+                    let polls = budget_polls.fetch_add(1, Ordering::Relaxed) + 1;
+                    if polls > budget {
+                        let mut slot = shared.budget_message.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(format!(
+                                "Execution exceeded its interrupt budget of {budget}"
+                            ));
+                        }
+                        return true;
+                    }
                 }
                 shared.finished.load(Ordering::Relaxed)
             })))
@@ -878,6 +900,12 @@ async fn run_vm(
                     .globals()
                     .set("__pi_settle", settle)
                     .map_err(|e| e.to_string())?;
+                let stalled: rquickjs::Function =
+                    api_obj.get("stalled").map_err(|e| e.to_string())?;
+                vctx
+                    .globals()
+                    .set("__pi_stalled", stalled)
+                    .map_err(|e| e.to_string())?;
                 let mut eval_opts = rquickjs::context::EvalOptions::default();
                 // pi runs scripts as sloppy-mode global code; rquickjs's
                 // default eval is strict, which would make silent built-in
@@ -910,6 +938,15 @@ async fn run_vm(
                     }
                     if shared.abort_hit.load(Ordering::Relaxed) {
                         let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
+                        *shared.fail_result.lock().unwrap() = Some(fail.clone());
+                        return fail;
+                    }
+                    // The budget interrupt can surface from run's synchronous
+                    // prefix itself (a script that computes before its first
+                    // await throws inside `run.call`) — pi classifies it as
+                    // the budget timeout (inline.ts:94).
+                    if let Some(message) = shared.budget_message.lock().unwrap().clone() {
+                        let fail = shared.fail(ErrorKind::Timeout, &message);
                         *shared.fail_result.lock().unwrap() = Some(fail.clone());
                         return fail;
                     }
@@ -995,20 +1032,15 @@ async fn run_vm(
                 }
             });
 
-            // The tick loop (v1's pattern; pi: the worker drives the VM; a
-            // never-settling script with no call in flight fails after a few
-            // idle ticks).
+            // The tick loop. Each iteration is pi's `drain()` (vm.ts:243-250):
+            // run queued jobs, then ask the prelude's `stalled()` — done fires
+            // immediately when the script waits on nothing that can resume it
+            // (no tool call pending, no timers), instead of a wall-clock idle
+            // heuristic.
             let tick = Duration::from_millis(25);
-            let mut idle_ticks = 0u32;
             let done_parts: Option<DoneParts> = loop {
-                // Drive the VM's pending jobs (promise reactions: the body,
-                // the `then` that fires `done`, tool continuations).
-                while vctx.execute_pending_job() {}
-                // `done` through the bridge?
-                if let Some(parts) = shared.done_parts.lock().unwrap().take() {
-                    break Some(parts);
-                }
-                // Stop-arms: deadline/abort pre-empt everything.
+                // Stop-arms first (pi: an interrupt is uncatchable — a budget
+                // exhaustion rewrites any race it wins, inline.ts:94).
                 if run_signal.is_cancelled() {
                     let fail = shared.fail(ErrorKind::Aborted, "the run was aborted");
                     *shared.fail_result.lock().unwrap() = Some(fail);
@@ -1018,6 +1050,39 @@ async fn run_vm(
                     let fail = shared.fail(ErrorKind::Timeout, "the deadline expired");
                     *shared.fail_result.lock().unwrap() = Some(fail);
                     break None;
+                }
+                if let Some(message) = shared.budget_message.lock().unwrap().clone() {
+                    let fail = shared.fail(ErrorKind::Timeout, &message);
+                    *shared.fail_result.lock().unwrap() = Some(fail);
+                    break None;
+                }
+                // Drive the VM's pending jobs (promise reactions: the body,
+                // the `then` that fires `done`, tool continuations).
+                while vctx.execute_pending_job() {}
+                // The budget interrupt fired during the drain (pi: a failed
+                // job is the interrupt — the budget rewrites it, inline.ts:94).
+                if let Some(message) = shared.budget_message.lock().unwrap().clone() {
+                    let fail = shared.fail(ErrorKind::Timeout, &message);
+                    *shared.fail_result.lock().unwrap() = Some(fail);
+                    break None;
+                }
+                // pi vm.ts:249: after the drain, `stalled()` — it calls done
+                // internally when the script waits on nothing that can resume
+                // it; pending tool calls keep it harmless.
+                let stalled = vctx
+                    .globals()
+                    .get::<_, rquickjs::Function>("__pi_stalled")
+                    .ok()
+                    .and_then(|stalled| stalled.call::<_, bool>(()).ok())
+                    .unwrap_or(false);
+                if stalled
+                    && let Some(parts) = shared.done_parts.lock().unwrap().take()
+                {
+                    break Some(parts);
+                }
+                // `done` through the bridge?
+                if let Some(parts) = shared.done_parts.lock().unwrap().take() {
+                    break Some(parts);
                 }
                 tokio::select! {
                     settled = &mut script_future => {
@@ -1043,6 +1108,11 @@ async fn run_vm(
                             *shared.fail_result.lock().unwrap() = Some(fail);
                             break None;
                         }
+                        if let Some(message) = shared.budget_message.lock().unwrap().clone() {
+                            let fail = shared.fail(ErrorKind::Timeout, &message);
+                            *shared.fail_result.lock().unwrap() = Some(fail);
+                            break None;
+                        }
                         if let Some(parts) = shared.done_parts.lock().unwrap().take() {
                             break Some(parts);
                         }
@@ -1050,17 +1120,6 @@ async fn run_vm(
                             let fail = shared.fail(ErrorKind::Script, &fail_message);
                             *shared.fail_result.lock().unwrap() = Some(fail);
                             break None;
-                        }
-                        if shared.outstanding.lock().unwrap().is_empty() {
-                            idle_ticks += 1;
-                            if idle_ticks >= 3 {
-                                let fail = shared.fail(
-                                    ErrorKind::Script,
-                                    "script waits on a promise that can never settle (no timers; no tool call pending)",
-                                );
-                                *shared.fail_result.lock().unwrap() = Some(fail);
-                                break None;
-                            }
                         }
                     }
                     _ = &mut pump => {
@@ -1084,19 +1143,6 @@ async fn run_vm(
                             && let Some(parts) = shared.done_parts.lock().unwrap().take()
                         {
                             break Some(parts);
-                        }
-                        if shared.outstanding.lock().unwrap().is_empty() {
-                            idle_ticks += 1;
-                            if idle_ticks >= 3 {
-                                let fail = shared.fail(
-                                    ErrorKind::Script,
-                                    "script waits on a promise that can never settle (no timers; no tool call pending)",
-                                );
-                                *shared.fail_result.lock().unwrap() = Some(fail);
-                                break None;
-                            }
-                        } else {
-                            idle_ticks = 0;
                         }
                     }
                 }
